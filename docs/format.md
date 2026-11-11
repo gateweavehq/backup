@@ -119,9 +119,12 @@ Left out: SQLite's own tables (`sqlite_*`), Cloudflare's (`_cf_*`) and the shado
 tables, whose contents are rebuilt instead. A contentless FTS5 table (`content=''`) can't be rebuilt
 from anything, so it comes back empty, and the manifest says so.
 
-The restore turns the lines back into SQL: the tables, then the rows as `INSERT` statements, then
-the counters, the indexes, triggers and views, then the rebuilds, with foreign keys deferred. That
-SQL works with `wrangler d1 execute --file` and with SQLite itself.
+The restore turns the lines back into SQL: the tables and their unique indexes, then the rows as
+`INSERT` statements, then the counters, the other indexes, triggers and views, then the rebuilds,
+with foreign keys deferred. Unique indexes come first because a foreign key may point at columns
+only such an index makes unique, and SQLite refuses rows for it until the index exists, deferred or
+not; D1 always checks foreign keys. That SQL works with `wrangler d1 execute --file` and with
+SQLite itself.
 
 ## Retention
 

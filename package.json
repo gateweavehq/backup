@@ -1,0 +1,21 @@
+{
+	"name": "gateweave-backup",
+	"private": true,
+	"license": "AGPL-3.0-only",
+	"type": "module",
+	"packageManager": "pnpm@12.4.2",
+	"engines": {
+		"node": ">=22.13"
+	},
+	"scripts": {
+		"typecheck": "pnpm -r typecheck",
+		"test": "pnpm -r test",
+		"check": "biome check",
+		"format": "biome check --write",
+		"verify": "pnpm check && pnpm typecheck && pnpm test"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.6.5",
+		"typescript": "catalog:"
+	}
+}

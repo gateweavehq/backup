@@ -1,0 +1,16 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Versions shared across workspace packages. Reference them with "catalog:".
+catalog:
+  "@cloudflare/vitest-plugin": 1.6.0
+  "@types/node": 26.6.6
+  typescript: 7.0.2
+  vitest: 5.1.0
+  wrangler: 4.158.0
+  zod: 4.6.7
+
+allowBuilds:
+  esbuild: true
+  workerd: true

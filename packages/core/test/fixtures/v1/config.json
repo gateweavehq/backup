@@ -1,0 +1,12 @@
+{
+	"format": "gateweave-backup",
+	"version": 1,
+	"id": "da5357c00e8ae436074d452fbd0866dd",
+	"created": "2026-11-11T20:00:00.000Z",
+	"chunker": {
+		"min": 262144,
+		"avg": 1048576,
+		"max": 4194304
+	},
+	"check": "AQCqUauua6c1-v2sKcE-k2jQYJDQyB3mVXXkdjADpsNvYSuT68uzUWE5JDh_-w"
+}

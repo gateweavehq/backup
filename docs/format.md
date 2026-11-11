@@ -1,0 +1,122 @@
+# Repository format, version 1
+
+A backup repository is a set of objects under one prefix in a bucket: R2, or any S3-compatible
+store. Everything in it can be restored from the key and the objects alone, with no Gateweave
+service running. That's a promise to the people who rely on these backups, so this document is the
+contract: code that reads or writes a repository follows it, and a change to it is a new version.
+
+## Objects
+
+| Key                    | Holds                                           | Sealed |
+| ---------------------- | ----------------------------------------------- | ------ |
+| `config.json`          | The repository's id, format version and chunker | No     |
+| `snapshots/<name>`     | One snapshot's manifest                         | Yes    |
+| `data/<id[0..2]>/<id>` | One chunk of data, named by its id              | Yes    |
+
+A snapshot's name is its time and a random part, `20261111T200500Z-3f9a1c2e`. Names sort by time.
+
+`config.json` is plain JSON:
+
+```json
+{
+	"format": "gateweave-backup",
+	"version": 1,
+	"id": "<32 hex characters, random>",
+	"created": "2026-11-11T20:05:00.000Z",
+	"chunker": { "min": 262144, "avg": 1048576, "max": 4194304 },
+	"check": "<base64url of a sealed blob>"
+}
+```
+
+`check` is the text `gateweave-backup` sealed with the label `config:<id>`. Opening it proves the key
+is the right one before anything is written.
+
+## Keys
+
+The owner keeps one master key: 32 random bytes, written as base64url (43 characters). Gateweave
+never stores it anywhere else. Lose it and the backups can't be read.
+
+Two keys are derived from it with HKDF-SHA256, with the repository's id (16 bytes) as the salt, so
+the same master key gives different keys in different repositories:
+
+| `info`                         | Length   | Used for                        |
+| ------------------------------ | -------- | ------------------------------- |
+| `gateweave-backup v1 seal`     | 32 bytes | AES-256-GCM, sealing every blob |
+| `gateweave-backup v1 chunk-id` | 32 bytes | HMAC-SHA256, naming chunks      |
+| `gateweave-backup v1 chunker`  | 1 KiB    | The chunker's gear table        |
+
+## Sealed blobs
+
+```
+byte 0       version, 1
+byte 1       flags: bit 0 set means the plaintext was compressed with deflate-raw first
+bytes 2-13   nonce, 12 random bytes
+bytes 14-    AES-256-GCM ciphertext, then its 16-byte tag
+```
+
+The additional authenticated data is the label's UTF-8 bytes followed by bytes 0 to 13. The label
+says what the blob is: `chunk:<id>` for a chunk, `snapshot:<name>` for a manifest, `config:<id>` for
+the check. So a blob moved to another name doesn't open.
+
+A blob is compressed only when that makes it smaller. Compressing before encrypting can reveal
+something through sizes when an attacker writes part of the data and watches the bucket. Someone
+who can do both already reads more than sizes, so we accept it, as restic and Borg do.
+
+## Chunks
+
+A file's bytes are cut into chunks with FastCDC (content-defined chunking): a 32-bit gear hash over
+the bytes, normalized with a stricter mask before the average size and a looser one after it. The
+gear table comes from the key, so chunk boundaries say nothing to someone without it. Because cuts
+depend on content, an edit in the middle of a dump changes only the chunks around it.
+
+A chunk's id is the lowercase hex HMAC-SHA256 of its plaintext under the chunk-id key. A chunk that
+already exists isn't uploaded again.
+
+## Manifests
+
+A manifest is JSON, sealed:
+
+```json
+{
+	"version": 1,
+	"name": "20261111T200500Z-3f9a1c2e",
+	"created": "2026-11-11T20:05:00.000Z",
+	"source": { "kind": "d1", "name": "gateweave-id" },
+	"files": [
+		{ "path": "database.jsonl", "size": 123456, "sha256": "<hex>", "chunks": ["<id>", "..."] }
+	],
+	"meta": {}
+}
+```
+
+`sha256` is the plain SHA-256 of the whole file, checked after a restore joins its chunks. `meta`
+holds what the source wants to say, such as a dump's table and row counts.
+
+## SQLite dumps
+
+D1 and Durable Object databases are dumped to `database.jsonl`: one JSON object per line, in this
+order. Lines, not SQL, so a value with a line break in it can't split a statement, and so the
+restore can check what it reads.
+
+| `k`                        | Fields                                               | Meaning                                                                |
+| -------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------- |
+| `head`                     | `format: "sqlite-jsonl"`, `version: 1`, `consistent` | Start. `consistent` is true when every row was read at the same moment |
+| `table`                    | `name`, `sql`, `cols`                                | A table, its `CREATE` statement and the columns its rows list          |
+| `virtual`                  | `name`, `sql`, `cols`, `content`                     | A virtual table. `content` is `own`, `external` or `none` (FTS5)       |
+| `row`                      | `t`, `v`                                             | A row of table `t`: its values as SQL literals, joined by commas       |
+| `seq`                      | `name`, `seq`                                        | An `AUTOINCREMENT` counter (`sqlite_sequence`)                         |
+| `index`, `trigger`, `view` | `name`, `sql`                                        | Made after the rows, as `.dump` does                                   |
+| `rebuild`                  | `t`                                                  | Rebuild an external-content FTS5 index                                 |
+| `end`                      | `tables`, `rows`                                     | End. A dump without it is incomplete                                   |
+
+Values come from SQLite's own `quote()`, so integers keep every digit, reals round-trip, text is
+escaped and blobs are `X'..'`. Columns are the ones `PRAGMA table_info` lists, which leaves out
+generated columns.
+
+Left out: SQLite's own tables (`sqlite_*`), Cloudflare's (`_cf_*`) and the shadow tables of virtual
+tables, whose contents are rebuilt instead. A contentless FTS5 table (`content=''`) can't be rebuilt
+from anything, so it comes back empty, and the manifest says so.
+
+The restore turns the lines back into SQL: the tables, then the rows as `INSERT` statements, then
+the counters, the indexes, triggers and views, then the rebuilds, with foreign keys deferred. That
+SQL works with `wrangler d1 execute --file` and with SQLite itself.

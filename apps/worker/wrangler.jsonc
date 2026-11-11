@@ -50,5 +50,58 @@
 		// The master key, from `pnpm keygen`. Keep a copy somewhere safe: without it, no backup
 		// opens, and nobody can recover it.
 		"required": ["BACKUP_KEY"]
+	},
+	"env": {
+		// Gateweave Cloud's own backups: `npx wrangler deploy --env gateweave`. The bucket is in the EU
+		// jurisdiction and locked for 21 days. Gateweave's privacy policy says recovery copies last up
+		// to 30 days, so nothing is kept longer: 7 days and 3 weeks of snapshots, then at most a day
+		// for the next prune, plus whatever the lock still holds, stays under it.
+		"gateweave": {
+			"name": "gateweave-backup",
+			"d1_databases": [
+				{
+					"binding": "CATALOG",
+					"database_name": "gateweave-backup",
+					"database_id": "6588a2ad-1506-4ad8-ae41-4d6d1ab349e3",
+					"migrations_dir": "migrations"
+				},
+				{
+					"binding": "ID_DB",
+					"database_name": "gateweave-id",
+					"database_id": "5d2bfea4-2af1-4e9e-b966-c9df3b012d2a"
+				},
+				{
+					"binding": "TRACK_DB",
+					"database_name": "gateweave-track",
+					"database_id": "66bf2056-ee6d-48fe-a9a3-70c0a43712ea"
+				},
+				{
+					"binding": "AGENTS_DB",
+					"database_name": "gateweave-agents",
+					"database_id": "9d5a98e2-835c-4462-a0d5-d273a21340d8"
+				}
+			],
+			"r2_buckets": [
+				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" }
+			],
+			"workflows": [
+				{
+					"name": "gateweave-backup",
+					"binding": "BACKUP",
+					"class_name": "BackupWorkflow",
+					"schedules": ["17 3 * * *"],
+					"concurrency": { "limit": 1 }
+				}
+			],
+			"vars": {
+				"SOURCES": [
+					{ "name": "id", "kind": "d1", "binding": "ID_DB" },
+					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
+					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" }
+				],
+				"RETENTION": "1l 7d 3w"
+			},
+			"secrets": { "required": ["BACKUP_KEY"] }
+		}
 	}
 }

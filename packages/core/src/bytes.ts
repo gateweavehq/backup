@@ -1,8 +1,9 @@
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export function utf8(text: string): Uint8Array<ArrayBuffer> {
-	return encoder.encode(text);
+	// Workers' types don't say what the DOM's do: the encoder always makes a fresh ArrayBuffer.
+	return encoder.encode(text) as Uint8Array<ArrayBuffer>;
 }
 
 export function fromUtf8(bytes: Uint8Array): string {

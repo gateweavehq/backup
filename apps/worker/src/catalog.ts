@@ -1,0 +1,123 @@
+/**
+ * The catalog in D1 (migrations/0001_catalog.sql). Every write here is safe to repeat, since a
+ * Workflow step that wrote and then failed runs again.
+ */
+
+/** Long enough for any run; a run that died holding the lock frees it when this runs out. */
+export const LEASE_MS = 12 * 60 * 60 * 1000;
+
+const ERROR_LENGTH = 1000;
+
+export async function startRun(
+	db: D1Database,
+	run: { id: string; instance: string; source: string; at: number },
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO run (id, instance, source, started_at, status) VALUES (?1, ?2, ?3, ?4, 'running')
+			ON CONFLICT (id) DO NOTHING`,
+		)
+		.bind(run.id, run.instance, run.source, run.at)
+		.run();
+}
+
+/** Takes the source's lock for `holder`, if nobody else holds it. Says whether it did. */
+export async function takeLock(
+	db: D1Database,
+	source: string,
+	holder: string,
+	now: number,
+): Promise<boolean> {
+	const result = await db
+		.prepare(
+			`INSERT INTO lock (source, holder, until) VALUES (?1, ?2, ?3)
+			ON CONFLICT (source) DO UPDATE SET holder = excluded.holder, until = excluded.until
+			WHERE lock.holder = excluded.holder OR lock.until < ?4`,
+		)
+		.bind(source, holder, now + LEASE_MS, now)
+		.run();
+	return result.meta.changes > 0;
+}
+
+export async function releaseLock(db: D1Database, source: string, holder: string): Promise<void> {
+	await db.prepare("DELETE FROM lock WHERE source = ?1 AND holder = ?2").bind(source, holder).run();
+}
+
+export interface SnapshotRecord {
+	source: string;
+	name: string;
+	created: string;
+	tables: number;
+	rows: number;
+	size: number;
+	newBytes: number;
+	empty: string[];
+}
+
+export async function recordSnapshot(
+	db: D1Database,
+	runId: string,
+	snapshot: SnapshotRecord,
+): Promise<void> {
+	await db.batch([
+		db
+			.prepare(
+				`INSERT INTO snapshot (source, name, created_at, table_count, row_count, size, empty)
+				VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (source, name) DO NOTHING`,
+			)
+			.bind(
+				snapshot.source,
+				snapshot.name,
+				Date.parse(snapshot.created),
+				snapshot.tables,
+				snapshot.rows,
+				snapshot.size,
+				JSON.stringify(snapshot.empty),
+			),
+		db
+			.prepare(
+				`UPDATE run SET snapshot = ?2, table_count = ?3, row_count = ?4, size = ?5, new_bytes = ?6
+				WHERE id = ?1`,
+			)
+			.bind(runId, snapshot.name, snapshot.tables, snapshot.rows, snapshot.size, snapshot.newBytes),
+	]);
+}
+
+export async function finishRun(
+	db: D1Database,
+	run: {
+		id: string;
+		source: string;
+		at: number;
+		forgotten: string[];
+		heldSnapshots: number;
+		deleted: number;
+		held: number;
+	},
+): Promise<void> {
+	await db.batch([
+		...run.forgotten.map((name) =>
+			db
+				.prepare(
+					"UPDATE snapshot SET forgotten_at = ?3 WHERE source = ?1 AND name = ?2 AND forgotten_at IS NULL",
+				)
+				.bind(run.source, name, run.at),
+		),
+		db
+			.prepare(
+				`UPDATE run SET status = 'ok', finished_at = ?2, forgotten = ?3, held_snapshots = ?4,
+				deleted_chunks = ?5, held_chunks = ?6 WHERE id = ?1`,
+			)
+			.bind(run.id, run.at, run.forgotten.length, run.heldSnapshots, run.deleted, run.held),
+	]);
+}
+
+export async function failRun(
+	db: D1Database,
+	run: { id: string; at: number; error: string },
+): Promise<void> {
+	await db
+		.prepare("UPDATE run SET status = 'failed', finished_at = ?2, error = ?3 WHERE id = ?1")
+		.bind(run.id, run.at, run.error.slice(0, ERROR_LENGTH))
+		.run();
+}

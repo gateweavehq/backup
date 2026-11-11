@@ -1,0 +1,23 @@
+{
+	"name": "@gateweave/backup-worker",
+	"version": "0.0.0",
+	"private": true,
+	"license": "AGPL-3.0-only",
+	"type": "module",
+	"scripts": {
+		"typegen": "wrangler types",
+		"typecheck": "wrangler types && tsc && tsc -p test",
+		"test": "vitest run",
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy"
+	},
+	"dependencies": {
+		"@gateweave/backup-core": "workspace:*"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-plugin": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "catalog:",
+		"wrangler": "catalog:"
+	}
+}

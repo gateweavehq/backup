@@ -47,6 +47,14 @@ export interface WriteStats {
 	newBytes: number;
 }
 
+/** What a prune found and did. */
+export interface PruneStats {
+	snapshots: number;
+	chunks: number;
+	deleted: number;
+	held: number;
+}
+
 export class RepositoryError extends Error {
 	override name = "RepositoryError";
 }
@@ -60,6 +68,10 @@ function snapshotKey(name: string): string {
 }
 
 const SNAPSHOT_NAME = /^\d{8}T\d{6}Z-[0-9a-f]{8}$/;
+/** The part of a snapshot's name that tells its second: `20261111T200500Z`. */
+const SECOND_LENGTH = 16;
+/** Only objects named as chunks are pruned; anything else under `data/` isn't ours to delete. */
+const CHUNK_KEY = /^data\/([0-9a-f]{2})\/(\1[0-9a-f]{62})$/;
 
 /** A snapshot's name: when it was made, to the second, and a random part. They sort by time. */
 export function snapshotName(at: Date): string {
@@ -188,14 +200,22 @@ export class Repository {
 		return { entry: { path, size, sha256: await hash.digest(), chunks }, stats };
 	}
 
-	/** Seals and stores a snapshot's manifest. The snapshot exists once this returns. */
+	/**
+	 * Seals and stores a snapshot's manifest. The snapshot exists once this returns.
+	 *
+	 * Names tell the time to the second, and retention takes the newest by name. So a snapshot made
+	 * in a second that already has one takes the next free second, and the newer sorts last.
+	 */
 	async commit(
 		source: SourceInfo,
 		files: FileEntry[],
 		meta: Record<string, unknown> = {},
 		now = new Date(),
 	): Promise<Manifest> {
-		const name = snapshotName(now);
+		const taken = new Set((await this.snapshots()).map((n) => n.slice(0, SECOND_LENGTH)));
+		let at = now.getTime();
+		while (taken.has(snapshotName(new Date(at)).slice(0, SECOND_LENGTH))) at += 1000;
+		const name = snapshotName(new Date(at));
 		const manifest: Manifest = {
 			version: FORMAT_VERSION,
 			name,
@@ -228,6 +248,52 @@ export class Repository {
 			throw new RepositoryError(`Snapshot ${name} is damaged.`);
 		}
 		return manifest as Manifest;
+	}
+
+	/**
+	 * Deletes a snapshot's manifest. Its chunks stay until `prune()`, so a snapshot forgotten by
+	 * mistake can still be found in a copy of the store until then.
+	 */
+	async forget(name: string): Promise<void> {
+		if (!SNAPSHOT_NAME.test(name)) throw new RepositoryError("That is not a snapshot's name.");
+		await this.#store.delete(snapshotKey(name));
+	}
+
+	/**
+	 * Deletes the chunks no snapshot points to. It opens every manifest first, and stops without
+	 * deleting anything if one doesn't open: a chunk is only let go when it is known to be unused.
+	 * Nothing else may write to the repository meanwhile, or a chunk a run has just found stored
+	 * could go before its manifest is written; the caller holds the lock.
+	 *
+	 * An object the store refuses to delete, as a locked bucket does inside its retention period,
+	 * is counted as held and left for a later prune.
+	 */
+	async prune(): Promise<PruneStats> {
+		const used = new Set<string>();
+		const snapshots = await this.snapshots();
+		for (const name of snapshots) {
+			for (const file of (await this.manifest(name)).files) {
+				for (const id of file.chunks) used.add(id);
+			}
+		}
+		const stats: PruneStats = { snapshots: snapshots.length, chunks: 0, deleted: 0, held: 0 };
+		const unused: string[] = [];
+		for await (const key of this.#store.list("data/")) {
+			const id = CHUNK_KEY.exec(key)?.[2];
+			if (!id) continue;
+			stats.chunks++;
+			if (!used.has(id)) unused.push(id);
+		}
+		for (const id of unused) {
+			this.#known.delete(id);
+			try {
+				await this.#store.delete(chunkKey(id));
+				stats.deleted++;
+			} catch {
+				stats.held++;
+			}
+		}
+		return stats;
 	}
 
 	/** A file's bytes, chunk by chunk, each one checked against its id. */

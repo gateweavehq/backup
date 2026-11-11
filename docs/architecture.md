@@ -37,7 +37,7 @@ the same account.
 | Piece                | What it does                                                            |
 | -------------------- | ----------------------------------------------------------------------- |
 | `packages/core`      | The format: keys, sealing, chunking, repositories, SQLite dumps         |
-| `apps/worker` (next) | Schedules, sources and destinations, the catalog, alerts, restore tests |
+| `apps/worker`        | Schedules, sources and destinations, the catalog, alerts, restore tests |
 | A restore CLI (next) | Reads a repository with the key and writes the files back               |
 
 ### Core
@@ -54,7 +54,10 @@ the same account.
   indexes over another table are rebuilt, FTS5 tables that keep their own text are copied with
   their rowids, and contentless ones are reported as coming back empty.
 
-### Worker (next)
+### Worker
+
+[deploy.md](deploy.md) says how to set it up. Today it backs up D1 into one R2 bucket, with the
+catalog, the lock and retention; the rest of this section is still to come where it says so.
 
 - **Runs in the owner's own Cloudflare account,** through the Deploy button, so the data and the
   key never pass through Gateweave. A hosted version would hold a token for every customer's
@@ -62,13 +65,21 @@ the same account.
 - **Sources through bindings,** not API tokens: a D1 binding per database, an R2 binding per bucket,
   a KV binding per namespace, and an RPC binding (`backup()`) for a Durable Object app that offers
   one. Track, Agents and Mail will offer one first.
-- **Cloudflare Workflows** run each backup. Steps are durable and retried, and a large export can
-  resume where it stopped. Cron Triggers start them.
-- **A D1 catalog** of sources, runs, snapshots and restore tests feeds the page, the alerts and MCP.
-- **Retention:** 7 daily, 4 weekly and 12 monthly snapshots by default. Pruning deletes manifests
-  first, then chunks nothing points to.
-- **Alerts:** a failed or late backup sends mail, opens a Track issue or calls a webhook.
-- **MCP:** agents can list and check backups. A restore needs a person.
+- **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
+  prune, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
+  and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
+  `wrangler workflows trigger` starts one by hand.
+- **A D1 catalog** of runs, snapshots and locks (restore tests next) feeds the page, the alerts and
+  MCP. It describes the bucket and never replaces it.
+- **A lock per source.** Pruning deletes the chunks no manifest names, so it must never meet a run
+  that has found a chunk stored and not yet written its manifest. A run takes the source's lock
+  before its first write and gives it back after its last; one that dies frees it after 12 hours.
+  The Workflow also runs one instance at a time, but scheduled instances may start past that limit.
+- **Retention:** the newest snapshot, then 7 daily, 4 weekly and 12 monthly by default. Pruning
+  forgets manifests first, then deletes the chunks nothing points to. The snapshot a run just made
+  always stays.
+- **Alerts (next):** a failed or late backup sends mail, opens a Track issue or calls a webhook.
+- **MCP (next):** agents can list and check backups. A restore needs a person.
 
 ## Decisions
 

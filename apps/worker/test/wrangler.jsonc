@@ -1,0 +1,29 @@
+// The Worker as the tests run it: the real bindings, plus a source to back up and an empty
+// database to restore into.
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "gateweave-backup-test",
+	"main": "../src/index.ts",
+	"compatibility_date": "2026-11-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"d1_databases": [
+		{ "binding": "CATALOG", "database_name": "catalog", "database_id": "catalog" },
+		{ "binding": "SOURCE_DB", "database_name": "source", "database_id": "source" },
+		{ "binding": "RESTORE_DB", "database_name": "restore", "database_id": "restore" }
+	],
+	"r2_buckets": [{ "binding": "VAULT", "bucket_name": "vault" }],
+	"workflows": [
+		{
+			"name": "gateweave-backup-test",
+			"binding": "BACKUP",
+			"class_name": "BackupWorkflow"
+		}
+	],
+	"vars": {
+		"SOURCES": [
+			{ "name": "app", "kind": "d1", "binding": "SOURCE_DB" },
+			{ "name": "broken", "kind": "d1", "binding": "VAULT" }
+		],
+		"RETENTION": "1l 7d 4w 12m"
+	}
+}

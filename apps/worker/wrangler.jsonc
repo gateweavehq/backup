@@ -1,0 +1,54 @@
+// Gateweave Backup's Worker. It runs in the account whose data it backs up: see docs/deploy.md.
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gateweave-backup",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-01",
+	"compatibility_flags": ["nodejs_compat"],
+	// It answers no requests, so it needs no public address.
+	"workers_dev": false,
+	"observability": { "enabled": true },
+	// A step dumps, chunks and seals a whole database. Five minutes of CPU is the most a Workflow
+	// step may have, and needs Workers Paid; Workflows on Free get 10 ms a step, which no backup fits.
+	"limits": { "cpu_ms": 300000 },
+	"d1_databases": [
+		{
+			// The catalog: runs, snapshots and locks. Not a source; it can be rebuilt from the bucket.
+			"binding": "CATALOG",
+			"database_name": "gateweave-backup",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			// Where the repositories live, one folder per source. Lock it: see docs/deploy.md.
+			"binding": "VAULT",
+			"bucket_name": "gateweave-backup"
+		}
+	],
+	"workflows": [
+		{
+			"name": "gateweave-backup",
+			"binding": "BACKUP",
+			"class_name": "BackupWorkflow",
+			// Every night at 03:17 UTC, away from the top of the hour when crons crowd.
+			"schedules": ["17 3 * * *"],
+			// One run at a time. A run also takes a lock per source, since scheduled instances may
+			// start past this limit.
+			"concurrency": { "limit": 1 }
+		}
+	],
+	"vars": {
+		// What to back up. Each D1 source needs a binding of its own in `d1_databases`, and a name
+		// that never changes: it is the repository's folder in the bucket. For example:
+		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" }]
+		"SOURCES": [],
+		// The newest snapshot, then one a day for 7 days, a week for 4 weeks, a month for 12 months.
+		"RETENTION": "1l 7d 4w 12m"
+	},
+	"secrets": {
+		// The master key, from `pnpm keygen`. Keep a copy somewhere safe: without it, no backup
+		// opens, and nobody can recover it.
+		"required": ["BACKUP_KEY"]
+	}
+}

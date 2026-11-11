@@ -14,6 +14,8 @@ contract: code that reads or writes a repository follows it, and a change to it 
 | `data/<id[0..2]>/<id>` | One chunk of data, named by its id              | Yes    |
 
 A snapshot's name is its time and a random part, `20261111T200500Z-3f9a1c2e`. Names sort by time.
+A writer gives each snapshot a second of its own: one made in a second that already has a snapshot
+takes the next free second, so the newest snapshot always sorts last.
 
 `config.json` is plain JSON:
 
@@ -120,3 +122,16 @@ from anything, so it comes back empty, and the manifest says so.
 The restore turns the lines back into SQL: the tables, then the rows as `INSERT` statements, then
 the counters, the indexes, triggers and views, then the rebuilds, with foreign keys deferred. That
 SQL works with `wrangler d1 execute --file` and with SQLite itself.
+
+## Retention
+
+Retention is the writer's business, not the format's: a reader restores whatever snapshots are
+there. What the Worker does, so that pruning is predictable:
+
+- A policy counts snapshots to keep: the newest `l`, then the newest snapshot of each of the newest
+  `d` days, `w` ISO weeks and `m` months that have one, all in UTC. It is written `1l 7d 4w 12m`,
+  which is the default. A snapshot kept by any rule stays.
+- Forgetting a snapshot deletes its manifest. Pruning then deletes the chunks no remaining manifest
+  names, and only those: it opens every manifest first, and deletes nothing if one doesn't open.
+- Nothing else writes to the repository while it prunes. A run holds the source's lock from its
+  first write to its last.

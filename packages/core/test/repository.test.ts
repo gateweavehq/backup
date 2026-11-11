@@ -144,10 +144,110 @@ describe("a repository", () => {
 		);
 	});
 
+	it("sorts snapshots made in the same second in the order they were made", async () => {
+		const { repo } = await fresh();
+		const { entry } = await repo.writeFile("f", utf8("x"));
+		const at = new Date("2026-11-11T20:05:00.100Z");
+		const names: string[] = [];
+		for (let i = 0; i < 5; i++) {
+			names.push((await repo.commit({ kind: "d1", name: "db" }, [entry], {}, at)).name);
+		}
+		expect(await repo.snapshots()).toEqual(names);
+		expect(names.map((n) => n.slice(0, 16))).toEqual([
+			"20261111T200500Z",
+			"20261111T200501Z",
+			"20261111T200502Z",
+			"20261111T200503Z",
+			"20261111T200504Z",
+		]);
+	});
+
 	it("keeps config.json readable, with nothing secret in it", async () => {
 		const { store, key } = await fresh();
 		const config = JSON.parse(fromUtf8(store.objects.get("config.json") ?? new Uint8Array()));
 		expect(config).toMatchObject({ format: "gateweave-backup", version: 1, chunker });
 		expect(JSON.stringify(config)).not.toContain(key);
+	});
+});
+
+describe("pruning", () => {
+	it("forgets a snapshot, then lets go of the chunks only it used", async () => {
+		const { store, key, repo } = await fresh();
+		const first = text(60_000, 1);
+		const second = new Uint8Array([...first.subarray(0, 30_000), ...text(30_000, 2)]);
+		const one = await repo.writeFile("database.jsonl", first);
+		const old = await repo.commit({ kind: "d1", name: "db" }, [one.entry]);
+		const two = await repo.writeFile("database.jsonl", second);
+		const kept = await repo.commit({ kind: "d1", name: "db" }, [two.entry]);
+
+		await repo.forget(old.name);
+		expect(await repo.snapshots()).toEqual([kept.name]);
+		const onlyOld = one.entry.chunks.filter((id) => !two.entry.chunks.includes(id));
+		expect(onlyOld.length).toBeGreaterThan(0);
+
+		const stats = await repo.prune();
+		expect(stats).toEqual({
+			snapshots: 1,
+			chunks: new Set([...one.entry.chunks, ...two.entry.chunks]).size,
+			deleted: new Set(onlyOld).size,
+			held: 0,
+		});
+		for (const id of onlyOld) expect(await store.has(`data/${id.slice(0, 2)}/${id}`)).toBe(false);
+
+		const again = await Repository.open(store, key);
+		expect(await again.readWholeFile(two.entry)).toEqual(second);
+		expect(await again.prune()).toMatchObject({ deleted: 0 });
+	});
+
+	it("deletes nothing when a manifest doesn't open", async () => {
+		const { store, repo } = await fresh();
+		const { entry } = await repo.writeFile("database.jsonl", text(20_000));
+		const manifest = await repo.commit(
+			{ kind: "d1", name: "db" },
+			[entry],
+			{},
+			new Date("2026-11-10T03:00:00Z"),
+		);
+		const loose = await repo.writeFile("loose.jsonl", text(20_000, 9));
+		const newer = await repo.commit(
+			{ kind: "d1", name: "db" },
+			[loose.entry],
+			{},
+			new Date("2026-11-11T03:00:00Z"),
+		);
+		const blob = store.objects.get(`snapshots/${manifest.name}`);
+		if (!blob) throw new Error("no manifest");
+		blob[blob.length - 1] = (blob[blob.length - 1] ?? 0) ^ 1;
+		await repo.forget(newer.name);
+
+		const before = store.objects.size;
+		await expect(repo.prune()).rejects.toThrow(/could not be opened/);
+		expect(store.objects.size).toBe(before);
+	});
+
+	it("leaves what isn't a chunk, and counts what the store won't delete", async () => {
+		const { store, repo } = await fresh();
+		const { entry } = await repo.writeFile("database.jsonl", text(20_000));
+		const manifest = await repo.commit({ kind: "d1", name: "db" }, [entry]);
+		store.objects.set("data/notes.txt", utf8("not ours"));
+		await repo.forget(manifest.name);
+
+		// A locked bucket refuses deletes inside its retention period.
+		store.delete = async () => {
+			throw new Error("This object is locked.");
+		};
+		const held = await repo.prune();
+		expect(held).toEqual({
+			snapshots: 0,
+			chunks: entry.chunks.length,
+			deleted: 0,
+			held: entry.chunks.length,
+		});
+		expect(store.objects.has("data/notes.txt")).toBe(true);
+	});
+
+	it("only forgets what is named as a snapshot", async () => {
+		const { repo } = await fresh();
+		await expect(repo.forget("../config.json")).rejects.toBeInstanceOf(RepositoryError);
 	});
 });

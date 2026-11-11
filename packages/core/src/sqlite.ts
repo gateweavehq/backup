@@ -222,20 +222,50 @@ function parseLine(text: string, number: number): Line {
 }
 
 /**
- * The SQL that restores a dump into an empty database, one statement at a time. It checks the dump
- * as it goes, and throws at the end if the dump is incomplete, so a caller that runs statements as
- * they come must run them in a transaction it can roll back.
+ * The unique indexes in a dump, by name. A foreign key may point at columns that only such an index
+ * makes unique, and SQLite refuses a row for it until that index exists ("foreign key mismatch"),
+ * even with checks deferred. D1 always checks foreign keys, so these are made before the rows.
+ */
+function uniqueIndexes(lines: readonly string[]): Map<string, string> {
+	const found = new Map<string, string>();
+	for (const text of lines) {
+		// Rows are nearly all of a dump, and never an index.
+		if (text.startsWith('{"k":"row"') || text.trim() === "") continue;
+		try {
+			const line = JSON.parse(text) as Line;
+			if (line.k === "index" && /^\s*CREATE\s+UNIQUE\s+INDEX\b/i.test(line.sql)) {
+				found.set(line.name, line.sql);
+			}
+		} catch {
+			// The second pass reports it, with its line number.
+		}
+	}
+	return found;
+}
+
+/**
+ * The SQL that restores a dump into an empty database, one statement at a time: the tables, their
+ * unique indexes, the rows, then the rest. It checks the dump as it goes, and throws at the end if
+ * the dump is incomplete, so a caller that runs statements as they come must run them in a
+ * transaction it can roll back.
  */
 export function* restoreSql(lines: Iterable<string>): Generator<string> {
+	const all = Array.isArray(lines) ? (lines as readonly string[]) : [...lines];
+	const unique = uniqueIndexes(all);
 	const columnsOf = new Map<string, string>();
 	let number = 0;
 	let rows = 0;
 	let ended = false;
-	for (const text of lines) {
+	let tablesMade = false;
+	for (const text of all) {
 		number++;
 		if (text.trim() === "") continue;
 		if (ended) throw new DumpError("The dump goes on after its end.");
 		const line = parseLine(text, number);
+		if (!tablesMade && number > 1 && line.k !== "table" && line.k !== "virtual") {
+			tablesMade = true;
+			for (const sql of unique.values()) yield `${sql};`;
+		}
 		if (number === 1) {
 			if (line.k !== "head" || line.format !== "sqlite-jsonl" || line.version !== 1) {
 				throw new DumpError("This is not a version 1 SQLite dump.");
@@ -262,6 +292,8 @@ export function* restoreSql(lines: Iterable<string>): Generator<string> {
 				yield `INSERT INTO sqlite_sequence (name, seq) VALUES ('${line.name.replaceAll("'", "''")}', ${Math.trunc(line.seq)});`;
 				break;
 			case "index":
+				if (!unique.has(line.name)) yield `${line.sql};`;
+				break;
 			case "trigger":
 			case "view":
 				yield `${line.sql};`;

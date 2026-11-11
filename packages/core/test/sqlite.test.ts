@@ -206,6 +206,28 @@ describe("SQLite dumps", () => {
 		await expect(dumpSqlite(restless)).rejects.toBeInstanceOf(DumpError);
 	});
 
+	it("restore a foreign key to a column only a unique index makes unique", async () => {
+		// Better Auth's OAuth tables do this. D1 always checks foreign keys, and SQLite refuses a
+		// row whose foreign key points at columns no index makes unique yet.
+		const db = new DatabaseSync(":memory:");
+		db.exec(`
+			CREATE TABLE token (id INTEGER PRIMARY KEY, client_id TEXT REFERENCES client(client_id));
+			CREATE TABLE client (id INTEGER PRIMARY KEY, client_id TEXT NOT NULL);
+			CREATE UNIQUE INDEX client_client_id ON client (client_id);
+			CREATE INDEX token_client ON token (client_id);
+			INSERT INTO client (client_id) VALUES ('a'), ('b');
+			INSERT INTO token (client_id) VALUES ('b'), ('a'), (NULL);
+		`);
+		const copy = restore((await dumpSqlite(reader(db))).lines);
+		expect(contents(copy, ["client", "token"])).toEqual(contents(db, ["client", "token"]));
+		const indexes = copy
+			.prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+			.all()
+			.map((r) => r.name);
+		expect(indexes).toEqual(["client_client_id", "token_client"]);
+		expect(copy.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+	});
+
 	it("dump an empty database", async () => {
 		const copy = restore((await dumpSqlite(reader(new DatabaseSync(":memory:")))).lines);
 		expect(copy.prepare("SELECT count(*) AS n FROM sqlite_master").get()).toEqual({ n: 0 });

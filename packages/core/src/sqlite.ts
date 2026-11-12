@@ -247,6 +247,138 @@ function uniqueIndexes(lines: readonly string[]): Map<string, string> {
 }
 
 /**
+ * The longest statement a restore makes, in UTF-8 bytes. D1 and Durable Objects refuse one over
+ * 100,000 bytes, and a D1 row may be 2 MB, so a longer row goes in through PARTS.
+ */
+const STATEMENT_BYTES = 90_000;
+
+/** The most a piece of a long value holds, in UTF-8 bytes, so its own INSERT stays short. */
+const PIECE_BYTES = 80_000;
+
+/**
+ * Where a restore puts a long value together: its pieces go into this table, then the row's INSERT
+ * reads them back joined. The table goes once the rows are in. A dump's table of the same name
+ * makes it take a number.
+ */
+const PARTS = "_gateweave_restore_parts";
+
+/** Whether a statement is longer than STATEMENT_BYTES, counting UTF-8 only when it could be. */
+function tooLong(statement: string): boolean {
+	return statement.length > STATEMENT_BYTES / 3 && utf8Length(statement) > STATEMENT_BYTES;
+}
+
+function utf8Length(text: string): number {
+	let bytes = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code < 0x80) bytes += 1;
+		else if (code < 0x800) bytes += 2;
+		else if (code >= 0xd800 && code < 0xdc00 && i + 1 < text.length) {
+			bytes += 4;
+			i++;
+		} else bytes += 3;
+	}
+	return bytes;
+}
+
+/** A row's values: the literals `quote()` wrote, joined by commas. */
+function literals(values: string, table: string): string[] {
+	const out: string[] = [];
+	const broken = () => new DumpError(`A row of ${table} has values that don't parse.`);
+	let at = 0;
+	for (;;) {
+		let end: number;
+		const text = values[at] === "'";
+		if (text || values.startsWith("X'", at)) {
+			let from = at + (text ? 1 : 2);
+			for (;;) {
+				const quote = values.indexOf("'", from);
+				if (quote < 0) throw broken();
+				// Inside text a quote is doubled; a blob's hex has none.
+				if (text && values[quote + 1] === "'") {
+					from = quote + 2;
+					continue;
+				}
+				end = quote + 1;
+				break;
+			}
+		} else {
+			const comma = values.indexOf(",", at);
+			end = comma < 0 ? values.length : comma;
+		}
+		out.push(values.slice(at, end));
+		if (end === values.length) return out;
+		if (values[end] !== ",") throw broken();
+		at = end + 1;
+	}
+}
+
+/**
+ * The inside of a text or blob literal, cut into pieces of at most PIECE_BYTES. Never inside a
+ * doubled quote, which would end the piece's literal early, or inside a character.
+ */
+function cut(inside: string): string[] {
+	const pieces: string[] = [];
+	let start = 0;
+	let bytes = 0;
+	let i = 0;
+	while (i < inside.length) {
+		const code = inside.charCodeAt(i);
+		let width = 1;
+		let size = 3;
+		if (code === 0x27) {
+			width = 2;
+			size = 2;
+		} else if (code < 0x80) size = 1;
+		else if (code < 0x800) size = 2;
+		else if (code >= 0xd800 && code < 0xdc00 && i + 1 < inside.length) {
+			width = 2;
+			size = 4;
+		}
+		if (bytes + size > PIECE_BYTES && i > start) {
+			pieces.push(inside.slice(start, i));
+			start = i;
+			bytes = 0;
+		}
+		bytes += size;
+		i += width;
+	}
+	pieces.push(inside.slice(start));
+	return pieces;
+}
+
+/**
+ * A row too long for one statement: its longest values go into the parts table a piece at a time,
+ * and its INSERT reads each one back joined, then the parts are cleared for the next row.
+ */
+function* longRow(table: string, cols: string, values: string, parts: string): Generator<string> {
+	const shown = literals(values, table);
+	const insert = () => `INSERT INTO ${ident(table)} ${cols} VALUES (${shown.join(",")});`;
+	const longest = shown
+		.map((_, index) => index)
+		.sort((a, b) => (shown[b]?.length ?? 0) - (shown[a]?.length ?? 0));
+	for (const index of longest) {
+		if (!tooLong(insert())) break;
+		const literal = shown[index] ?? "";
+		const blob = literal.startsWith("X'");
+		// Only text and blobs grow long; a number or NULL is a few characters.
+		if (!blob && !literal.startsWith("'")) break;
+		let n = 0;
+		for (const piece of cut(literal.slice(blob ? 2 : 1, -1))) {
+			yield `INSERT INTO ${ident(parts)} (v, n, part) VALUES (${index}, ${n++}, '${piece}');`;
+		}
+		const joined = `group_concat(part, '' ORDER BY n)`;
+		shown[index] =
+			`(SELECT ${blob ? `unhex(${joined})` : joined} FROM ${ident(parts)} WHERE v = ${index})`;
+	}
+	if (tooLong(insert())) {
+		throw new DumpError(`A row of ${table} has too many values to restore in one statement.`);
+	}
+	yield insert();
+	yield `DELETE FROM ${ident(parts)};`;
+}
+
+/**
  * The SQL that restores a dump into an empty database, one statement at a time: the tables, their
  * unique indexes, the rows, then the rest. It checks the dump as it goes, and throws at the end if
  * the dump is incomplete, so a caller that runs statements as they come must run them in a
@@ -260,6 +392,7 @@ export function* restoreSql(lines: Iterable<string>): Generator<string> {
 	let rows = 0;
 	let ended = false;
 	let tablesMade = false;
+	let parts: string | undefined;
 	for (const text of all) {
 		number++;
 		if (text.trim() === "") continue;
@@ -287,7 +420,18 @@ export function* restoreSql(lines: Iterable<string>): Generator<string> {
 				if (!cols)
 					throw new DumpError(`Line ${number} has a row for a table the dump hasn't made.`);
 				rows++;
-				yield `INSERT INTO ${ident(line.t)} ${cols} VALUES (${line.v});`;
+				const statement = `INSERT INTO ${ident(line.t)} ${cols} VALUES (${line.v});`;
+				if (!tooLong(statement)) {
+					yield statement;
+					break;
+				}
+				if (parts === undefined) {
+					const taken = new Set([...columnsOf.keys()].map((name) => name.toLowerCase()));
+					parts = PARTS;
+					for (let n = 2; taken.has(parts); n++) parts = `${PARTS}_${n}`;
+					yield `CREATE TABLE ${ident(parts)} (v INTEGER NOT NULL, n INTEGER NOT NULL, part TEXT NOT NULL, PRIMARY KEY (v, n));`;
+				}
+				yield* longRow(line.t, cols, line.v, parts);
 				break;
 			}
 			case "seq":
@@ -308,6 +452,7 @@ export function* restoreSql(lines: Iterable<string>): Generator<string> {
 				if (line.rows !== rows) {
 					throw new DumpError(`The dump says ${line.rows} rows but holds ${rows}.`);
 				}
+				if (parts !== undefined) yield `DROP TABLE ${ident(parts)};`;
 				ended = true;
 				break;
 			case "head":

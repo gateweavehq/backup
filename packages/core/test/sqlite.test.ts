@@ -270,6 +270,73 @@ describe("restoring a dump", () => {
 	});
 });
 
+describe("restoring a row longer than a statement may be", () => {
+	/** Bytes that are no text at all: every value 0 to 255, over and over. */
+	const noise = (length: number) => Uint8Array.from({ length }, (_, i) => (i * 7919) % 256);
+
+	function longRows(): DatabaseSync {
+		const db = new DatabaseSync(":memory:");
+		db.exec(`
+			CREATE TABLE doc (id INTEGER PRIMARY KEY, title TEXT, body TEXT, data BLOB, score REAL);
+			CREATE TABLE strict_blob (id INTEGER PRIMARY KEY, b BLOB NOT NULL) STRICT;
+			CREATE TABLE keyed (k TEXT PRIMARY KEY, v TEXT CHECK (length(v) > 100000)) WITHOUT ROWID;
+			CREATE TABLE _gateweave_restore_parts (x TEXT);
+			CREATE VIRTUAL TABLE notes USING fts5(text);
+		`);
+		const doc = db.prepare("INSERT INTO doc VALUES (?, ?, ?, ?, ?)");
+		// Quotes, which are doubled in SQL, and characters of every UTF-8 length, at odd offsets, so
+		// pieces end next to each kind.
+		doc.run(1, "short", `x${"'".repeat(60_000)}é${"😀".repeat(30_000)}`, noise(150_000), 1.5);
+		doc.run(2, "two", "é".repeat(70_000), null, null);
+		doc.run(3, `t${"'🎉".repeat(20_000)}`, `b${"€'".repeat(25_000)}`, noise(60_000), -0.25);
+		doc.run(4, "small", "fits", noise(3), 0);
+		db.prepare("INSERT INTO strict_blob VALUES (?, ?)").run(1, noise(200_000));
+		db.prepare("INSERT INTO keyed VALUES (?, ?)").run("k", "v".repeat(150_000));
+		db.prepare("INSERT INTO _gateweave_restore_parts VALUES (?)").run("mine");
+		db.prepare("INSERT INTO notes (rowid, text) VALUES (?, ?)").run(7, "n".repeat(120_000));
+		return db;
+	}
+
+	const LONG_TABLES = ["doc", "strict_blob", "keyed", "_gateweave_restore_parts"];
+
+	it("keeps every statement under D1's limit and every value as it was", async () => {
+		const source = longRows();
+		const lines = (await dumpSqlite(reader(source))).lines;
+		const statements = [...restoreSql(lines)];
+		const longest = Math.max(...statements.map((sql) => Buffer.byteLength(sql, "utf8")));
+		expect(longest).toBeLessThanOrEqual(90_000);
+
+		const restored = restore(lines);
+		expect(contents(restored, LONG_TABLES)).toEqual(contents(source, LONG_TABLES));
+		const notes = "SELECT rowid, text FROM notes WHERE notes MATCH 'n*'";
+		expect(restored.prepare(notes).all()).toEqual(source.prepare(notes).all());
+		const types = "SELECT typeof(body) AS body, typeof(data) AS data FROM doc ORDER BY id";
+		expect(restored.prepare(types).all()).toEqual(source.prepare(types).all());
+	});
+
+	it("leaves no table of its own behind, and the dump's table of that name alone", async () => {
+		const lines = (await dumpSqlite(reader(longRows()))).lines;
+		const restored = restore(lines);
+		const names = (
+			restored.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+				name: string;
+			}[]
+		).map((row) => row.name);
+		expect(names).toContain("_gateweave_restore_parts");
+		expect(names.filter((name) => name.startsWith("_gateweave_restore_parts_"))).toEqual([]);
+		expect(restored.prepare("SELECT x FROM _gateweave_restore_parts").all()).toEqual([
+			{ x: "mine" },
+		]);
+	});
+
+	it("writes short rows as before", async () => {
+		const lines = (await dumpSqlite(reader(sample()))).lines;
+		expect([...restoreSql(lines)].some((sql) => sql.includes("_gateweave_restore_parts"))).toBe(
+			false,
+		);
+	});
+});
+
 describe("FTS5 content", () => {
 	it("tells own, external and contentless tables apart", () => {
 		expect(ftsContent("CREATE VIRTUAL TABLE a USING fts5(x)")).toBe("own");

@@ -44,6 +44,10 @@
 		"RETENTION": "1l 7d 4w 12m",
 		"RESTORE_TEST_DAYS": "30",
 		"JURISDICTION": "",
-		"ALERT_FROM": ""
+		"ALERT_FROM": "",
+		// The stand-in for a bucket elsewhere (test/s3-worker.js), which every fetch reaches.
+		"COPY_TO": "s3://offsite/backups",
+		"COPY_ENDPOINT": "https://copy.test",
+		"COPY_REGION": "auto"
 	}
 }

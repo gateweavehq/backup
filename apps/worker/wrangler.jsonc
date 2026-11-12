@@ -71,7 +71,15 @@
 		// Who email alerts come from, as "Name <address>" or an address, on a domain Email Service
 		// sends from. Where they go is the secret ALERT_TO. Empty sends none: see docs/deploy.md,
 		// which also has alerts by webhook.
-		"ALERT_FROM": ""
+		"ALERT_FROM": "",
+		// A copy outside Cloudflare, at an S3-compatible bucket elsewhere, as s3://<bucket>/<folder>.
+		// Each run sends it what is new, and the copy keeps RETENTION on its own. Empty makes none.
+		// The bucket's endpoint goes in COPY_ENDPOINT, the region it signs for in COPY_REGION, and a
+		// key that may read, write and delete there in the secrets COPY_ACCESS_KEY_ID and
+		// COPY_SECRET_ACCESS_KEY: see docs/deploy.md.
+		"COPY_TO": "",
+		"COPY_ENDPOINT": "",
+		"COPY_REGION": ""
 	},
 	"secrets": {
 		// The master key, from `pnpm keygen`. Keep a copy somewhere safe: without it, no backup
@@ -146,7 +154,11 @@
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",
 				"JURISDICTION": "eu",
-				"ALERT_FROM": "Gateweave Backup <backup@gateweave.com>"
+				"ALERT_FROM": "Gateweave Backup <backup@gateweave.com>",
+				// No copy outside Cloudflare yet: choosing its provider is the owner's call (WEB-35).
+				"COPY_TO": "",
+				"COPY_ENDPOINT": "",
+				"COPY_REGION": ""
 			},
 			"secrets": { "required": ["BACKUP_KEY"] }
 		}

@@ -4,6 +4,7 @@
  */
 
 import type { Alert } from "./alerts";
+import type { CopyResult } from "./copy";
 import type { RestoreTestResult } from "./restore-test";
 
 /** Long enough for any run; a run that died holding the lock frees it when this runs out. */
@@ -183,6 +184,37 @@ export async function recordTest(
 			test.objects ?? null,
 			test.size,
 			test.error?.slice(0, ERROR_LENGTH) ?? null,
+		)
+		.run();
+}
+
+/** Keeps how a run's copy outside Cloudflare went, once per run. */
+export async function recordCopy(
+	db: D1Database,
+	runId: string,
+	copy: CopyResult,
+	at: number,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO copy (run, source, copied_at, status, object_count, size, snapshot_count,
+				forgotten, held_snapshots, deleted_chunks, held_chunks, error)
+				VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+				ON CONFLICT (run) DO NOTHING`,
+		)
+		.bind(
+			runId,
+			copy.source,
+			at,
+			copy.ok ? "ok" : "failed",
+			copy.objects,
+			copy.bytes,
+			copy.prune?.snapshots ?? null,
+			copy.prune?.forgotten ?? null,
+			copy.prune?.heldSnapshots ?? null,
+			copy.prune?.deleted ?? null,
+			copy.prune?.held ?? null,
+			copy.error?.slice(0, ERROR_LENGTH) ?? null,
 		)
 		.run();
 }

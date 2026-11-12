@@ -176,6 +176,58 @@ its `error`, and the daily check sends it again for three days.
 `RETENTION` keeps the newest snapshot, the newest of each of the last 7 days, 4 weeks and 12 months
 (`1l 7d 4w 12m`). [format.md](format.md#retention) says exactly how it counts.
 
+## A copy outside Cloudflare
+
+A bucket in your Cloudflare account doesn't survive the account being lost or misused, so each run
+can also copy every source's repository to an S3-compatible bucket at another provider, such as
+Backblaze B2, Hetzner Object Storage or Scaleway. It sends the sealed objects as they are in the
+vault, and only those the copy lacks: the provider sees chunk ids, snapshot times and sizes, never
+data, and the key stays with you.
+
+Make a bucket there, and a key that may list, read, write and delete in that bucket only. Then set
+where it is in `wrangler.jsonc`:
+
+```jsonc
+"vars": {
+	"COPY_TO": "s3://<bucket>/<folder>",
+	"COPY_ENDPOINT": "https://s3.eu-central-003.backblazeb2.com",
+	"COPY_REGION": "eu-central-003"
+}
+```
+
+`COPY_ENDPOINT` is the bucket's S3 endpoint, an https URL, and `COPY_REGION` the region requests are
+signed for, both from the provider's page for the bucket (`auto` is R2's). Deploy, and give it the
+key:
+
+```sh
+npx wrangler deploy
+npx wrangler secret put COPY_ACCESS_KEY_ID
+npx wrangler secret put COPY_SECRET_ACCESS_KEY
+```
+
+The copy runs after a source's backup, prune and restore test, still under its lock, 200 objects or
+256 MB to a step. Chunks go first and manifests last, so a copy cut short holds no snapshot without
+its chunks, and the next step or run goes on from what is there. The catalog's `copy` table has a
+row per source and run:
+
+```sh
+npx wrangler d1 execute gateweave-backup --remote \
+  --command "SELECT source, status, object_count, size, snapshot_count, error FROM copy ORDER BY copied_at DESC LIMIT 5"
+```
+
+A copy that fails, such as one the bucket refuses, fails the run and sends an alert; the backup
+stays in the vault, and the next run sends what is missing.
+
+The copy keeps its own retention, `RETENTION` on the snapshots it holds: a snapshot the vault lost
+stays in the copy until the policy lets it go, and none stays longer than the vault would keep it.
+If you lock that bucket too, keep its lock no longer than your retention, and with versioning, add a
+lifecycle rule that removes noncurrent versions after a few days, or what retention lets go stays
+there. If you tell people their data is gone some days after they delete it, count the copy in.
+
+A copy that holds another repository than the vault, as it does after the vault's was lost and
+made anew, is left as it is, and the run says so. Move its folder aside to start a new copy. Restore
+tests read the vault; to check the copy, point the CLI at it ([restore.md](restore.md)).
+
 ## Restoring
 
 [restore.md](restore.md): the CLI reads the bucket with a read-only R2 token and the key, and
@@ -187,7 +239,6 @@ writes SQL for a new D1 database, or a bucket's objects to a folder.
 - A bucket's backup takes a Workflow step per 1,000 objects listed and per 100 objects or 256 MB
   read, so the first backup of a bucket of hundreds of thousands of objects takes too many steps
   for one run. Later runs read only what is new.
-- One copy, in R2. The copy at another provider comes next.
 - A database whose rows come to more than 12 million characters is read a page at a time (see
   [Core](architecture.md#core)). One that changes during each of three tries is kept anyway, and
   says it wasn't read at one moment. A table that large without a rowid (`WITHOUT ROWID`) can't be

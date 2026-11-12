@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authorization, EMPTY_SHA256 } from "../src/sigv4";
+import { authorization, EMPTY_SHA256 } from "../src";
 
 /** The worked examples in AWS's "Signature Calculations for the Authorization Header" for S3. */
 const credentials = {
@@ -9,9 +9,9 @@ const credentials = {
 const AT = "20130524T000000Z";
 
 describe("SigV4", () => {
-	it("signs AWS's GET Object example", () => {
+	it("signs AWS's GET Object example", async () => {
 		expect(
-			authorization(
+			await authorization(
 				{
 					method: "GET",
 					path: "/test.txt",
@@ -33,9 +33,9 @@ describe("SigV4", () => {
 		);
 	});
 
-	it("signs AWS's list objects example, with its query in canonical order", () => {
+	it("signs AWS's list objects example, with its query in canonical order", async () => {
 		expect(
-			authorization(
+			await authorization(
 				{
 					method: "GET",
 					path: "/",

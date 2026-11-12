@@ -13,6 +13,7 @@ import {
 	DUMP_FILE,
 	dumpSqliteTo,
 	type FileEntry,
+	type ObjectStore,
 	objectFile,
 	parseMasterKey,
 	parseRetention,
@@ -20,6 +21,7 @@ import {
 	RepositoryError,
 	readBucketIndex,
 	retain,
+	S3Error,
 	SealError,
 	type SqlReader,
 	utf8,
@@ -43,6 +45,7 @@ import {
 	finishRun,
 	markAlertFailed,
 	recordAlert,
+	recordCopy,
 	recordSnapshot,
 	recordTest,
 	releaseLock,
@@ -51,6 +54,7 @@ import {
 	takeLock,
 	testDue,
 } from "./catalog";
+import { CopyError, type CopyResult, copyNew, copyTarget, pruneCopy } from "./copy";
 import { type RestoreTestResult, testerFor, testInterval } from "./restore-test";
 import {
 	type D1Source,
@@ -79,6 +83,9 @@ export interface SourceResult {
 	error?: string;
 	/** Why the restore test failed. */
 	testError?: string;
+	/** How the copy outside Cloudflare went, when COPY_TO names one. */
+	copy?: "ok" | "failed";
+	copyError?: string;
 }
 
 /** Catalog writes are small, and D1 hiccups pass. */
@@ -158,9 +165,13 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		}
 		const failed = results.filter((r) => r.status === "failed").map((r) => r.source);
 		const untested = results.filter((r) => r.test === "failed").map((r) => r.source);
+		const uncopied = results.filter((r) => r.copy === "failed").map((r) => r.source);
 		const problems = [
 			...(failed.length > 0 ? [`The backup of ${failed.join(", ")} failed.`] : []),
 			...(untested.length > 0 ? [`The restore test of ${untested.join(", ")} failed.`] : []),
+			...(uncopied.length > 0
+				? [`The copy of ${uncopied.join(", ")} outside Cloudflare failed.`]
+				: []),
 		];
 		const asked = event.payload?.alert === true;
 		if (problems.length > 0 || asked) {
@@ -229,6 +240,8 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			const pruned = await step.do(`${name}: prune`, HEAVY, () => this.#prune(source, made));
 			// After the prune and under the lock, so the test also proves the prune left what it needs.
 			const test = await this.#testIfDue(id, name, made, step, force);
+			// Still under the lock, so the vault doesn't change while it is copied.
+			const copy = await this.#copyIfSet(id, source, step);
 			await step.do(`${name}: finish`, QUICK, async () => {
 				await finishRun(db, { id, source: name, at: Date.now(), ...pruned });
 				await releaseLock(db, name, instance);
@@ -236,6 +249,8 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			const result: SourceResult = { source: name, status: "ok", snapshot };
 			if (test) result.test = test.passed ? "passed" : "failed";
 			if (test?.error) result.testError = test.error;
+			if (copy) result.copy = copy.ok ? "ok" : "failed";
+			if (copy?.error) result.copyError = copy.error;
 			return result;
 		} catch (error) {
 			const reason = describe(error);
@@ -290,6 +305,64 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		}
 		await step.do(`${name}: test recorded`, QUICK, () => recordTest(db, runId, result, Date.now()));
 		return result;
+	}
+
+	/**
+	 * Copies the source's repository outside Cloudflare when COPY_TO names a bucket, some objects a
+	 * step, then prunes the copy by its own retention. How it went goes to the catalog; a failure
+	 * is alerted and leaves the backup as it is, in the vault.
+	 */
+	async #copyIfSet(
+		runId: string,
+		source: Source,
+		step: WorkflowStep,
+	): Promise<CopyResult | undefined> {
+		const name = source.name;
+		const result: CopyResult = { source: name, ok: true, objects: 0, bytes: 0 };
+		let set = false;
+		try {
+			set = copyTarget(this.env) !== undefined;
+		} catch (error) {
+			// Recorded as a failed copy, so a wrong setting shows in the catalog and the alert.
+			Object.assign(result, { ok: false, error: `The copy didn't start: ${describe(error)}` });
+		}
+		if (!set && result.ok) return undefined;
+		if (set) {
+			try {
+				for (let i = 1; ; i++) {
+					const progress = await step.do(`${name}: copy ${i}`, HEAVY, () =>
+						copying(async () => {
+							const repo = await this.#repository(source);
+							const vault = new R2Store(this.env.VAULT, `${name}/`);
+							return copyNew(repo, vault, this.#copyOf(name));
+						}),
+					);
+					result.objects += progress.copied;
+					result.bytes += progress.bytes;
+					if (progress.done) break;
+					if (progress.copied === 0) throw new Error("A copy step copied nothing.");
+				}
+				result.prune = await step.do(`${name}: copy prune`, HEAVY, () =>
+					copying(() => {
+						const policy = setting(() => parseRetention(this.env.RETENTION));
+						return pruneCopy(this.#copyOf(name), this.env.BACKUP_KEY, policy);
+					}),
+				);
+			} catch (error) {
+				Object.assign(result, { ok: false, error: describe(error) });
+			}
+		}
+		await step.do(`${name}: copy recorded`, QUICK, () =>
+			recordCopy(this.env.CATALOG, runId, result, Date.now()),
+		);
+		return result;
+	}
+
+	/** One source's repository in the copy. */
+	#copyOf(name: string): ObjectStore {
+		const target = setting(() => copyTarget(this.env));
+		if (!target) throw new NonRetryableError("COPY_TO names no bucket.");
+		return target.storeFor(name);
 	}
 
 	/**
@@ -648,6 +721,20 @@ async function* encodeLines(lines: AsyncIterable<string>): AsyncGenerator<Uint8A
 		}
 	}
 	if (batch.length > 0) yield utf8(`${batch.join("\n")}\n`);
+}
+
+/**
+ * Runs a copy step. A refusal no retry mends, such as a wrong key (403) or a missing bucket (404),
+ * or an object the vault lacks, fails it at once rather than after every retry's wait.
+ */
+async function copying<T>(work: () => Promise<T>): Promise<T> {
+	try {
+		return await work();
+	} catch (error) {
+		const refused = error instanceof S3Error && error.status !== undefined && error.status < 500;
+		if (refused || error instanceof CopyError) throw new NonRetryableError(describe(error));
+		throw error;
+	}
 }
 
 /** Reads a setting, so that one the Worker can't use fails at once rather than after retries. */

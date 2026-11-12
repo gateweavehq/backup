@@ -324,6 +324,23 @@ export class Repository {
 		return stats;
 	}
 
+	/**
+	 * The objects a copy of this repository needs, in the order a copy must take them: every chunk
+	 * a snapshot uses, then `config.json`, then the manifests. So a copy made in pieces never holds
+	 * a manifest without its chunks. Chunks no snapshot uses are left out, as a prune would let them
+	 * go. Like `prune()`, it stops if a manifest doesn't open.
+	 */
+	async neededKeys(): Promise<string[]> {
+		const names = await this.snapshots();
+		const chunks = new Set<string>();
+		for (const name of names) {
+			for (const file of (await this.manifest(name)).files) {
+				for (const id of file.chunks) chunks.add(chunkKey(id));
+			}
+		}
+		return [...[...chunks].sort(), CONFIG_KEY, ...names.map(snapshotKey)];
+	}
+
 	/** A file's bytes, chunk by chunk, each one checked against its id. */
 	async *readFile(entry: FileEntry): AsyncGenerator<Uint8Array<ArrayBuffer>> {
 		for (const id of entry.chunks) {

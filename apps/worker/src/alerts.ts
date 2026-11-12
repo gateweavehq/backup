@@ -215,9 +215,11 @@ export function runAlert(
 ): Alert {
 	const failed = results.filter((r) => r.status === "failed").map((r) => r.source);
 	const untested = results.filter((r) => r.test === "failed").map((r) => r.source);
+	const uncopied = results.filter((r) => r.copy === "failed").map((r) => r.source);
 	const problems = [
 		...(failed.length > 0 ? [`the backup of ${list(failed)} failed`] : []),
 		...(untested.length > 0 ? [`the restore test of ${list(untested)} failed`] : []),
+		...(uncopied.length > 0 ? [`the copy of ${list(uncopied)} outside Cloudflare failed`] : []),
 	];
 	const items = results.map((r): AlertItem => {
 		const { source } = r;
@@ -237,7 +239,18 @@ export function runAlert(
 			};
 		}
 		const tested = r.test === "passed" ? ", restored and counted by a restore test" : "";
-		return { source, label: "Backed up", tone: "good", detail: `${snapshot}${tested}.` };
+		if (r.copy === "failed") {
+			const detail = `${snapshot} was made${tested}, but copying it outside Cloudflare failed. It is in the vault.`;
+			return {
+				source,
+				label: "Copy failed",
+				tone: "bad",
+				detail,
+				...(r.copyError && { error: r.copyError }),
+			};
+		}
+		const copied = r.copy === "ok" ? `${tested ? "," : ""} and copied outside Cloudflare` : "";
+		return { source, label: "Backed up", tone: "good", detail: `${snapshot}${tested}${copied}.` };
 	});
 	const heading = problems.length > 0 ? problems.join(", and ") : "every backup was made";
 	const message: AlertMessage = {
@@ -246,7 +259,7 @@ export function runAlert(
 		meta: `${asked && problems.length === 0 ? "Test alert" : "Backup run"} · ${when(at)}`,
 		items,
 		more: {
-			text: "The catalog's run and restore_test tables have the details, under this run's id:",
+			text: `The catalog's ${results.some((r) => r.copy) ? "run, restore_test and copy" : "run and restore_test"} tables have the details, under this run's id:`,
 			code: instance,
 		},
 	};

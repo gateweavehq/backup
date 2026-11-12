@@ -166,8 +166,6 @@ writes SQL for a new D1 database.
 ## What it can't do yet
 
 - D1 and an app's Durable Objects only. R2 and KV come next.
-- The restore CLI writes a snapshot of an app's objects as stored, a dump per object. SQL for each
-  comes next.
 - An object is read in one call, which must fit in one response, as a D1 batch must.
 - One copy, in R2. The copy at another provider comes next.
 - A database is read in one D1 batch, which must fit in one response. Very large databases will need

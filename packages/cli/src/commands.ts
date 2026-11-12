@@ -11,7 +11,9 @@ import {
 	type FileEntry,
 	fromUtf8,
 	ident,
+	isDumpFile,
 	type Manifest,
+	objectOf,
 	type Repository,
 	RepositoryError,
 	restoreSql,
@@ -63,10 +65,51 @@ async function* verified(repo: Repository, entry: FileEntry): AsyncGenerator<Uin
 	}
 }
 
-async function readDump(repo: Repository, manifest: Manifest): Promise<string[]> {
-	const entry = manifest.files.find((file) => file.path === DUMP_FILE);
-	if (!entry) throw new RestoreError(`Snapshot ${manifest.name} holds no database.`);
+/** One database a snapshot holds: a D1 source's, or one of an app's Durable Objects. */
+interface Dump {
+	/** The object's name, or null for a D1 source's one database. */
+	object: string | null;
+	entry: FileEntry;
+}
+
+/** Whether a snapshot is of an app's Durable Objects, a database each (docs/format.md). */
+function ofObjects(manifest: Manifest): boolean {
+	return manifest.source.kind === "do";
+}
+
+/** The databases a snapshot holds, in its order, or only the object `object` names. */
+function dumpsOf(manifest: Manifest, object?: string): Dump[] {
+	const dumps: Dump[] = [];
+	for (const entry of manifest.files) {
+		if (entry.path === DUMP_FILE) dumps.push({ object: null, entry });
+		const name = objectOf(entry.path);
+		if (name !== undefined) dumps.push({ object: name, entry });
+	}
+	if (object === undefined) return dumps;
+	if (!ofObjects(manifest)) {
+		throw new RestoreError(
+			`Snapshot ${manifest.name} is of one database, not of objects: leave out --object.`,
+		);
+	}
+	const found = dumps.filter((dump) => dump.object === object);
+	if (found.length === 0) {
+		throw new RestoreError(`Snapshot ${manifest.name} holds no object ${object}.`);
+	}
+	return found;
+}
+
+async function readDump(repo: Repository, entry: FileEntry): Promise<string[]> {
 	return splitLines(fromUtf8(await repo.readWholeFile(entry)));
+}
+
+/** Runs `work` on one of a snapshot's databases; a failure in an object's says which object. */
+async function onDump<T>(dump: Dump, work: () => Promise<T>): Promise<T> {
+	try {
+		return await work();
+	} catch (error) {
+		if (dump.object === null) throw error;
+		throw new RestoreError(`${dump.object}: ${messageOf(error)}`);
+	}
 }
 
 /**
@@ -144,16 +187,32 @@ export async function listSnapshots(repo: Repository): Promise<(SnapshotInfo | D
 	return out;
 }
 
-/** A preview of a snapshot before restoring it: its files and, for a database, its tables. */
+export interface ShownSnapshot extends SnapshotInfo {
+	/** For a snapshot of an app's Durable Objects: their names. */
+	objects: string[] | null;
+	/** The object whose database is shown, when one was asked for. */
+	object: string | null;
+	database: DumpSummary | null;
+}
+
+/**
+ * A preview of a snapshot before restoring it: its files and, for a database, its tables. A
+ * snapshot of objects lists them, and shows the tables of the one `object` names.
+ */
 export async function showSnapshot(
 	repo: Repository,
 	name: string,
-): Promise<SnapshotInfo & { database: DumpSummary | null }> {
+	object?: string,
+): Promise<ShownSnapshot> {
 	const manifest = await repo.manifest(name);
-	const hasDump = manifest.files.some((file) => file.path === DUMP_FILE);
+	const dumps = dumpsOf(manifest, object);
+	const many = ofObjects(manifest);
+	const shown = many && object === undefined ? undefined : dumps[0];
 	return {
 		...infoOf(manifest),
-		database: hasDump ? summarizeDump(await readDump(repo, manifest)) : null,
+		objects: many ? dumpsOf(manifest).map((dump) => dump.object ?? "") : null,
+		object: shown?.object ?? null,
+		database: shown ? summarizeDump(await readDump(repo, shown.entry)) : null,
 	};
 }
 
@@ -161,14 +220,16 @@ export interface CheckResult {
 	name: string;
 	ok: boolean;
 	bytes: number;
-	/** For a database: the tables and rows that loaded into a scratch SQLite database. */
+	/** For a snapshot of an app's Durable Objects: how many it holds. */
+	objects?: number;
+	/** For a database, or all of them: the tables and rows that loaded into scratch SQLite. */
 	tables?: number;
 	rows?: number;
 	error?: string;
 }
 
 /**
- * Reads a snapshot as a restore would, and restores it into a database in memory: every chunk
+ * Reads a snapshot as a restore would, and restores each database in it into memory: every chunk
  * opened and checked against its id, every file against its size and SHA-256, and every table's
  * rows counted against the dump. Nothing is written to disk.
  */
@@ -178,32 +239,20 @@ export async function checkSnapshot(repo: Repository, name: string): Promise<Che
 		const manifest = await repo.manifest(name);
 		const result: CheckResult = { name, ok: true, bytes: 0 };
 		for (const entry of manifest.files) {
-			if (entry.path === DUMP_FILE) continue;
+			if (isDumpFile(entry.path)) continue;
 			for await (const chunk of verified(repo, entry)) bytes += chunk.length;
 		}
-		if (manifest.files.some((file) => file.path === DUMP_FILE)) {
-			const lines = await readDump(repo, manifest);
-			bytes += manifest.files.find((file) => file.path === DUMP_FILE)?.size ?? 0;
-			const summary = summarizeDump(lines);
-			const db = await openSqlite(":memory:");
-			try {
-				load(db, lines);
-				for (const table of summary.tables) {
-					if (table.virtual) continue;
-					const found = db.prepare(`SELECT count(*) AS n FROM ${ident(table.name)}`).get() as {
-						n: number;
-					};
-					if (found.n !== table.rows) {
-						throw new RestoreError(
-							`${table.name} came back with ${found.n} rows; the dump has ${table.rows}.`,
-						);
-					}
-				}
-			} finally {
-				db.close();
-			}
-			result.tables = summary.tables.length;
-			result.rows = summary.rows;
+		const dumps = dumpsOf(manifest);
+		if (ofObjects(manifest)) result.objects = dumps.length;
+		if (dumps.length > 0 || ofObjects(manifest)) Object.assign(result, { tables: 0, rows: 0 });
+		for (const dump of dumps) {
+			const summary = await onDump(dump, async () => {
+				const lines = await readDump(repo, dump.entry);
+				bytes += dump.entry.size;
+				return countLoaded(lines);
+			});
+			result.tables = (result.tables ?? 0) + summary.tables.length;
+			result.rows = (result.rows ?? 0) + summary.rows;
 		}
 		result.bytes = bytes;
 		return result;
@@ -212,42 +261,72 @@ export async function checkSnapshot(repo: Repository, name: string): Promise<Che
 	}
 }
 
+/** Loads a dump into a database in memory and counts every table's rows against it. */
+async function countLoaded(lines: string[]): Promise<DumpSummary> {
+	const summary = summarizeDump(lines);
+	const db = await openSqlite(":memory:");
+	try {
+		load(db, lines);
+		for (const table of summary.tables) {
+			if (table.virtual) continue;
+			const found = db.prepare(`SELECT count(*) AS n FROM ${ident(table.name)}`).get() as {
+				n: number;
+			};
+			if (found.n !== table.rows) {
+				throw new RestoreError(
+					`${table.name} came back with ${found.n} rows; the dump has ${table.rows}.`,
+				);
+			}
+		}
+	} finally {
+		db.close();
+	}
+	return summary;
+}
+
 export type RestoreAs = "sql" | "sqlite" | "files";
 
 export interface RestoreReport {
 	name: string;
 	as: RestoreAs;
 	written: string[];
-	database: DumpSummary | null;
+	/** Whether the snapshot is of an app's Durable Objects, a database each. */
+	objects: boolean;
+	/** What each database written holds: one, or one per object. */
+	databases: { object: string | null; summary: DumpSummary }[];
 }
 
 /**
  * Writes a snapshot out to a folder: as SQL to load into a new D1 database, as a SQLite file, or
- * as the files it holds. It writes only files that aren't there yet, and removes what it wrote
- * when anything fails, so nothing is ever restored over something else.
+ * as the files it holds. A snapshot of an app's Durable Objects writes `<object>.sql` or
+ * `<object>.sqlite` for each, or for the one `object` names. It writes only files that aren't
+ * there yet, and removes what it wrote when anything fails, so nothing is ever restored over
+ * something else.
  */
 export async function restoreSnapshot(
 	repo: Repository,
 	name: string,
-	{ to, as }: { to: string; as?: RestoreAs },
+	{ to, as, object }: { to: string; as?: RestoreAs; object?: string },
 ): Promise<RestoreReport> {
 	const manifest = await repo.manifest(name);
-	const hasDump = manifest.files.some((file) => file.path === DUMP_FILE);
-	const way: RestoreAs = as ?? (hasDump ? "sql" : "files");
-	if (way !== "files" && !hasDump) {
+	const dumps = dumpsOf(manifest, object);
+	const objects = ofObjects(manifest);
+	const way: RestoreAs = as ?? (dumps.length > 0 ? "sql" : "files");
+	if (way !== "files" && dumps.length === 0) {
 		throw new RestoreError(`Snapshot ${name} holds no database; restore it --as files.`);
 	}
 	const folder = resolve(to);
+	const files = object === undefined ? manifest.files : dumps.map((dump) => dump.entry);
 	const targets =
 		way === "files"
-			? manifest.files.map((file) => join(folder, ...safePath(file.path).split("/")))
-			: [join(folder, way === "sql" ? "database.sql" : "database.sqlite")];
+			? files.map((file) => join(folder, ...safePath(file.path).split("/")))
+			: dumps.map((dump) => join(folder, `${dump.object ?? "database"}.${way}`));
 	for (const target of targets) if (await exists(target)) throw taken(target);
 	await mkdir(folder, { recursive: true });
 	const written: string[] = [];
 	try {
 		if (way === "files") {
-			for (const [index, entry] of manifest.files.entries()) {
+			for (const [index, entry] of files.entries()) {
 				const target = targets[index] ?? "";
 				await mkdir(dirname(target), { recursive: true });
 				await writeNew(target, async (file) => {
@@ -256,40 +335,55 @@ export async function restoreSnapshot(
 				});
 				written.push(target);
 			}
-			return { name, as: way, written, database: null };
+			return { name, as: way, written, objects, databases: [] };
 		}
-		const lines = await readDump(repo, manifest);
-		const summary = summarizeDump(lines);
-		const target = targets[0] ?? "";
-		if (way === "sql") {
-			await writeNew(target, async (file) => {
-				let size = 0;
-				let batch = "";
-				for (const statement of restoreSql(lines)) {
-					batch += `${statement}\n`;
-					if (batch.length >= 1 << 20) {
-						size += await writeAll(file, batch);
-						batch = "";
-					}
-				}
-				return size + (await writeAll(file, batch));
+		const databases: RestoreReport["databases"] = [];
+		for (const [index, dump] of dumps.entries()) {
+			const target = targets[index] ?? "";
+			const summary = await onDump(dump, async () => {
+				const lines = await readDump(repo, dump.entry);
+				await writeDatabase(target, way, lines);
+				return summarizeDump(lines);
 			});
-		} else {
-			await writeNew(target, null, async (path) => {
-				const db = await openSqlite(path);
-				try {
-					load(db, lines);
-				} finally {
-					db.close();
-				}
-			});
+			written.push(target);
+			databases.push({ object: dump.object, summary });
 		}
-		written.push(target);
-		return { name, as: way, written, database: summary };
+		return { name, as: way, written, objects, databases };
 	} catch (error) {
 		for (const path of written) await unlink(path).catch(() => {});
 		throw error;
 	}
+}
+
+/** Writes one dump as SQL, or loads it into a new SQLite file. */
+async function writeDatabase(
+	target: string,
+	way: "sql" | "sqlite",
+	lines: string[],
+): Promise<void> {
+	if (way === "sql") {
+		await writeNew(target, async (file) => {
+			let size = 0;
+			let batch = "";
+			for (const statement of restoreSql(lines)) {
+				batch += `${statement}\n`;
+				if (batch.length >= 1 << 20) {
+					size += await writeAll(file, batch);
+					batch = "";
+				}
+			}
+			return size + (await writeAll(file, batch));
+		});
+		return;
+	}
+	await writeNew(target, null, async (path) => {
+		const db = await openSqlite(path);
+		try {
+			load(db, lines);
+		} finally {
+			db.close();
+		}
+	});
 }
 
 /**

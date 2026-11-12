@@ -52,9 +52,11 @@
 	// Email alerts need Email Service and a domain set up to send from (docs/deploy.md), then:
 	// "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["backup@example.com"] }],
 	"vars": {
-		// What to back up. Each D1 source needs a binding of its own in `d1_databases`, and a name
+		// What to back up. Each D1 source needs a binding of its own in `d1_databases`, an app's
+		// Durable Objects a service binding to its Backup entrypoint in `services`, and each a name
 		// that never changes: it is the repository's folder in the bucket. For example:
-		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" }]
+		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
+		//  { "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }]
 		"SOURCES": [],
 		// The newest snapshot, then one a day for 7 days, a week for 4 weeks, a month for 12 months.
 		"RETENTION": "1l 7d 4w 12m",
@@ -107,6 +109,10 @@
 			"r2_buckets": [
 				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" }
 			],
+			// Track's workspaces, each in a Durable Object, through Track's Backup entrypoint.
+			"services": [
+				{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" }
+			],
 			"durable_objects": {
 				"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
 			},
@@ -126,7 +132,8 @@
 				"SOURCES": [
 					{ "name": "id", "kind": "d1", "binding": "ID_DB" },
 					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
-					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" }
+					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" },
+					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }
 				],
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",

@@ -86,10 +86,12 @@ catalog, the lock and retention; the rest of this section is still to come where
   it also proves the prune kept what the snapshot needs. A failed test fails the run but keeps the
   backup, and the catalog says why.
 - **A restore test keeps no copy.** Only the empty tables are ever committed, and they are deleted
-  at the end, so the 30 days of point-in-time recovery a Durable Object's storage keeps never hold a
-  row. The rows can't go in with the tables: rolling back writes to an FTS5 table made in the same
-  transaction crashed workerd when we tried it. `JURISDICTION` keeps the objects where the bucket
-  is.
+  at the end. The 30 days of point-in-time recovery a Durable Object's storage keeps go back only to
+  committed states, so they never hold a row. After the rollback the test checks that every table
+  is empty again. The rows can't go in with the tables: rolling back writes to an FTS5 table made in
+  the same transaction crashed workerd when we tried it. `JURISDICTION` keeps the objects where the
+  bucket is. An object runs one test at a time, since a step that timed out may be tried again
+  while its first try is still running.
 - **Alerts (next):** a failed or late backup sends mail, opens a Track issue or calls a webhook.
 - **MCP (next):** agents can list and check backups. A restore needs a person.
 

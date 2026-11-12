@@ -46,15 +46,24 @@ const MAKES_TABLE = /^\s*CREATE\s+(?:VIRTUAL\s+)?TABLE\b/i;
  *
  * The rows are never committed. The tables are made and committed first, then the rows go in, are
  * counted and checked inside one transaction, and that transaction is rolled back. So no copy of
- * the data stays here, not even in the 30 days of point-in-time recovery that a Durable Object's
- * storage keeps: only empty tables reach it, and they are deleted at the end. (Making the tables
- * in the rolled-back transaction too would be simpler, but rolling back writes to an FTS5 table
- * made in the same transaction crashed workerd when we tried it.)
+ * the data stays here. The 30 days of point-in-time recovery a Durable Object's storage keeps go
+ * back only to committed states, and the only ones a test makes hold empty tables, which it deletes
+ * at the end. (Making the tables in the rolled-back transaction too would be simpler, but rolling
+ * back writes to an FTS5 table made in the same transaction crashed workerd when we tried it.)
  *
- * There is one object per source, named after it, so two tests of a source never overlap.
+ * There is one object per source, named after it, and it runs one test at a time: a Workflow step
+ * that timed out may be tried again while its first try is still running here.
  */
 export class RestoreTest extends DurableObject<Env> {
+	#queue: Promise<unknown> = Promise.resolve();
+
 	async restore(source: string, snapshot: string): Promise<RestoreTestResult> {
+		const turn = this.#queue.then(() => this.#restoreNow(source, snapshot));
+		this.#queue = turn.catch(() => {});
+		return turn;
+	}
+
+	async #restoreNow(source: string, snapshot: string): Promise<RestoreTestResult> {
 		const result: RestoreTestResult = {
 			source,
 			snapshot,
@@ -83,10 +92,14 @@ export class RestoreTest extends DurableObject<Env> {
 		const manifest = await repo.manifest(snapshot);
 		for (const entry of manifest.files) {
 			// Every file is read whole and checked against its size and hash; the dump is also restored.
-			const bytes = await repo.readWholeFile(entry);
+			if (entry.path !== DUMP_FILE) {
+				await repo.readWholeFile(entry);
+				result.size += entry.size;
+				continue;
+			}
+			// The whole dump is in memory a few times over while it loads: see docs/deploy.md.
+			const lines = splitLines(fromUtf8(await repo.readWholeFile(entry)));
 			result.size += entry.size;
-			if (entry.path !== DUMP_FILE) continue;
-			const lines = splitLines(fromUtf8(bytes));
 			const summary = summarizeDump(lines);
 			const meant = manifest.meta.rows;
 			if (typeof meant === "number" && meant !== summary.rows) {
@@ -151,6 +164,14 @@ export class RestoreTest extends DurableObject<Env> {
 			});
 		} catch (error) {
 			if (!(error instanceof RollBack)) throw error;
+		}
+		// The rows must be gone. If a rollback ever kept them, the test says so rather than pass.
+		for (const table of summary.tables) {
+			if (table.virtual) continue;
+			const kept = sql
+				.exec<{ n: number }>(`SELECT count(*) AS n FROM ${ident(table.name)}`)
+				.one().n;
+			if (kept > 0) throw new RestoreFailure(`${table.name} kept ${kept} rows after the rollback.`);
 		}
 	}
 }

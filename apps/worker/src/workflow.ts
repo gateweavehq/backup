@@ -135,28 +135,33 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		force: boolean,
 	): Promise<"passed" | "failed" | undefined> {
 		const db = this.env.CATALOG;
-		let result: RestoreTestResult;
+		const failed = (error: string): RestoreTestResult => ({
+			source: name,
+			snapshot,
+			passed: false,
+			tables: 0,
+			rows: 0,
+			size: 0,
+			error,
+		});
+		let result: RestoreTestResult | undefined;
 		try {
 			const due = await step.do(`${name}: test due`, QUICK, async () => {
 				const days = setting(() => testInterval(this.env.RESTORE_TEST_DAYS));
 				return force || (await testDue(db, name, Date.now(), days));
 			});
 			if (!due) return undefined;
-			result = await step.do(`${name}: restore test`, HEAVY, async () => {
+		} catch (error) {
+			// Recorded as a failed test, so a setting that stops every test shows in the catalog.
+			result = failed(`The test didn't start: ${describe(error)}`);
+		}
+		try {
+			result ??= await step.do(`${name}: restore test`, HEAVY, async () => {
 				const tester = setting(() => testerFor(this.env, name));
 				return (await tester.restore(name, snapshot)) as RestoreTestResult;
 			});
 		} catch (error) {
-			const reason = describe(error);
-			result = {
-				source: name,
-				snapshot,
-				passed: false,
-				tables: 0,
-				rows: 0,
-				size: 0,
-				error: reason,
-			};
+			result = failed(describe(error));
 		}
 		await step.do(`${name}: test recorded`, QUICK, () => recordTest(db, runId, result, Date.now()));
 		return result.passed ? "passed" : "failed";

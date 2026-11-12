@@ -335,9 +335,17 @@ describe("restore tests", () => {
 		expect(await tests()).toHaveLength(1);
 
 		const days = testInterval(env.RESTORE_TEST_DAYS);
-		await env.CATALOG.prepare("UPDATE restore_test SET tested_at = ?1")
-			.bind(Date.now() - days * 24 * 60 * 60 * 1000)
-			.run();
+		const hour = 60 * 60 * 1000;
+		const passedAgo = (ms: number) =>
+			env.CATALOG.prepare("UPDATE restore_test SET tested_at = ?1")
+				.bind(Date.now() - ms)
+				.run();
+		await passedAgo((days * 24 - 13) * hour);
+		await backUp("not-yet", { sources: ["app"] });
+		expect(await tests()).toHaveLength(1);
+
+		// Half a day early, so a nightly run that reaches the test a little sooner doesn't wait a night.
+		await passedAgo((days * 24 - 11) * hour);
 		const third = await backUp("a-month-on", { sources: ["app"] });
 		expect(third).toMatchObject({ ended: "complete", output: [{ test: "passed" }] });
 		expect(await tests()).toHaveLength(2);
@@ -414,6 +422,37 @@ describe("restore tests", () => {
 			error: "2 rows point to rows that aren't there, the first in member.",
 		});
 		expect(await testerTables("crafted")).toEqual([]);
+	});
+
+	it("take one at a time, so a second try of a step doesn't trip over the first", async () => {
+		await addTeams();
+		await backUp("made", { sources: ["app"] });
+		const [snapshot] = await (await repository()).snapshots();
+		const tester = testerFor(env, "app");
+		const both = await Promise.all([
+			tester.restore("app", snapshot ?? ""),
+			tester.restore("app", snapshot ?? ""),
+		]);
+		expect(both.map((test) => test.error ?? "passed")).toEqual(["passed", "passed"]);
+	});
+
+	it("fail a row SQLite refuses, naming the table and column but no value", async () => {
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const person = lines.find((line) => line.startsWith('{"k":"row","t":"person"')) ?? "";
+		const at = lines.indexOf(person);
+		const ended = (line: string) =>
+			line.replace(/"rows":(\d+)/, (_, n: string) => `"rows":${Number(n) + 1}`);
+		const twice = [...lines.slice(0, at), person, ...lines.slice(at)].map((line) =>
+			line.startsWith('{"k":"end"') ? ended(line) : line,
+		);
+		const snapshot = await commitDump("twice", twice);
+
+		const test = await testerFor(env, "twice").restore("twice", snapshot);
+		expect(test.error).toMatch(
+			/^INSERT INTO "person" failed: UNIQUE constraint failed: person\.id/,
+		);
+		expect(test.error).not.toContain("example.com");
+		expect(await testerTables("twice")).toEqual([]);
 	});
 
 	it("fail a dump that stops before its end", async () => {

@@ -362,12 +362,30 @@ export function summarizeDump(lines: readonly string[]): DumpSummary {
 	return summary;
 }
 
+/** A name as SQL writes it: quoted in any of SQLite's ways, or bare. */
+const NAME = /"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[^\s(,;]+/.source;
+
+/** The start of each statement a restore makes, up to the object it is about. */
+const STATEMENT_START = new RegExp(
+	[
+		`CREATE\\s+(?:UNIQUE\\s+|VIRTUAL\\s+|TEMP(?:ORARY)?\\s+)*(?:TABLE|INDEX|TRIGGER|VIEW)\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?:${NAME})`,
+		`INSERT\\s+INTO\\s+(?:${NAME})`,
+		`DELETE\\s+FROM\\s+(?:${NAME})`,
+		`PRAGMA\\s+\\w+`,
+	]
+		.map((start) => `^\\s*${start}`)
+		.join("|"),
+	"i",
+);
+
 /**
- * A restore statement by what it does and to which object, such as `INSERT INTO "person"`, never
- * its values: what an error about a statement may say.
+ * A restore statement by what it does and to which object, such as `INSERT INTO "person"`: what an
+ * error about a statement may say. Never its values, and never the rest of a view's or a trigger's
+ * SQL, which may hold literals.
  */
 export function describeStatement(statement: string): string {
-	return (statement.split(/\s*\(|\s+VALUES\b/i)[0] ?? "").slice(0, 120);
+	const start = STATEMENT_START.exec(statement)?.[0] ?? statement.trim().split(/\s/)[0] ?? "";
+	return start.trim().replace(/\s+/g, " ").slice(0, 120);
 }
 
 /** A dump's lines as one file, and back. */

@@ -126,6 +126,12 @@ export async function failRun(
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Nightly runs reach a source's test a little earlier or later each night, so a test is due half a
+ * day early rather than a night late.
+ */
+const DUE_EARLY_MS = 12 * 60 * 60 * 1000;
+
 /** Whether the source's restore test is due: it has never passed, or not for `days` days. */
 export async function testDue(
 	db: D1Database,
@@ -139,7 +145,7 @@ export async function testDue(
 		)
 		.bind(source)
 		.first<number | null>("at");
-	return last === null || last <= now - days * DAY_MS;
+	return last === null || last <= now - days * DAY_MS + DUE_EARLY_MS;
 }
 
 export async function recordTest(

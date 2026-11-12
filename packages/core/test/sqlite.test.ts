@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
 	DumpError,
+	describeStatement,
 	dumpSqlite,
 	ftsContent,
 	ident,
@@ -276,5 +277,28 @@ describe("FTS5 content", () => {
 		expect(ftsContent("CREATE VIRTUAL TABLE a USING fts5(x, content = issue)")).toBe("external");
 		expect(ftsContent("CREATE VIRTUAL TABLE a USING fts5(x, content='')")).toBe("none");
 		expect(ftsContent('CREATE VIRTUAL TABLE a USING fts5(x, content="")')).toBe("none");
+	});
+});
+
+describe("a statement in an error", () => {
+	it("says what it does and to which object, and nothing else", () => {
+		const said = {
+			'INSERT INTO "person" ("id", "email") VALUES (1, \'ada@example.com\');':
+				'INSERT INTO "person"',
+			"CREATE TABLE person (id INTEGER PRIMARY KEY, email TEXT DEFAULT 'x@y.z');":
+				"CREATE TABLE person",
+			"CREATE UNIQUE INDEX IF NOT EXISTS [by email] ON person (email);":
+				"CREATE UNIQUE INDEX IF NOT EXISTS [by email]",
+			"CREATE VIEW grown AS SELECT * FROM person WHERE email = 'ada@example.com';":
+				"CREATE VIEW grown",
+			"CREATE TRIGGER `on add` AFTER INSERT ON person WHEN new.email = 'ada@example.com' BEGIN SELECT 1; END;":
+				"CREATE TRIGGER `on add`",
+			"CREATE VIRTUAL TABLE search USING fts5 (email);": "CREATE VIRTUAL TABLE search",
+			"DELETE FROM sqlite_sequence WHERE name = 'person';": "DELETE FROM sqlite_sequence",
+			"PRAGMA defer_foreign_keys = on;": "PRAGMA defer_foreign_keys",
+		};
+		for (const [statement, description] of Object.entries(said)) {
+			expect(describeStatement(statement), statement).toBe(description);
+		}
 	});
 });

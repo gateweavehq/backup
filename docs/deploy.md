@@ -110,7 +110,5 @@ writes SQL for a new D1 database.
 - One copy, in R2. The copy at another provider comes next.
 - A database is read in one D1 batch, which must fit in one response. Very large databases will need
   a paged mode.
-- A row longer than 100 KB, as SQL, doesn't restore: D1 refuses a statement that long. A snapshot
-  that holds one fails its restore test.
 - A restore test holds the whole dump in memory a few times over while it loads, in a Durable
   Object's 128 MB. Dumps over about 20 MB will need a streamed test.

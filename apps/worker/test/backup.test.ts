@@ -149,6 +149,27 @@ describe("a backup run", () => {
 		expect((await env.CATALOG.prepare("SELECT * FROM lock").all()).results).toEqual([]);
 	});
 
+	it("restores a row longer than D1 takes in one statement", async () => {
+		await env.SOURCE_DB.batch([
+			env.SOURCE_DB.prepare("CREATE TABLE page (id INTEGER PRIMARY KEY, body TEXT, data BLOB)"),
+			env.SOURCE_DB.prepare("INSERT INTO page VALUES (1, ?1, ?2)").bind(
+				`'quoted' ${"wiki 📚 ".repeat(25_000)}`,
+				Uint8Array.from({ length: 120_000 }, (_, i) => i % 256),
+			),
+		]);
+		const result = await backUp("long", { sources: ["app"] });
+		expect(result).toMatchObject({ ended: "complete", output: [{ test: "passed" }] });
+
+		const repo = await repository();
+		const [name] = await repo.snapshots();
+		await restore(repo, name ?? "");
+		const page = "SELECT id, body, hex(data) AS data FROM page";
+		expect((await env.RESTORE_DB.prepare(page).all()).results).toEqual(
+			(await env.SOURCE_DB.prepare(page).all()).results,
+		);
+		expect((await env.RESTORE_DB.prepare(PEOPLE_QUERY).all()).results).toHaveLength(3);
+	});
+
 	it("leaves nothing readable in the bucket", async () => {
 		await backUp("sealed", { sources: ["app"] });
 		const listed = await env.VAULT.list({ prefix: "app/" });

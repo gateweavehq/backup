@@ -126,6 +126,14 @@ only such an index makes unique, and SQLite refuses rows for it until the index 
 not; D1 always checks foreign keys. That SQL works with `wrangler d1 execute --file` and with
 SQLite itself.
 
+No statement is longer than 90,000 bytes, since D1 and Durable Objects refuse one over 100,000 and
+a D1 row may be 2 MB. A row whose `INSERT` would be longer goes in through a table of the restore's
+own, `_gateweave_restore_parts` (with a number after it if the dump has a table of that name):
+its longest values are inserted there in pieces of up to 80,000 bytes, text as text and blobs as
+hex, and the row's `INSERT` reads each back with `group_concat(part, '' ORDER BY n)`, through
+`unhex()` for a blob. The pieces are deleted after each row and the table is dropped at the end.
+That needs SQLite 3.44 or later, which D1 has.
+
 ## Retention
 
 Retention is the writer's business, not the format's: a reader restores whatever snapshots are

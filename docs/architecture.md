@@ -49,10 +49,21 @@ the same account.
   changed in a few places stores only a few new chunks. Chunks are named by an HMAC of their
   plaintext, so the same data is stored once without revealing its hash.
 - **SQLite dumps:** one JSON line per table, row and object, built from SQLite's own `quote()`, so
-  every value comes back exactly. A dump reads its rows in one consistent read: a D1 batch is one
-  transaction, and a Durable Object's storage is synchronous. Virtual tables are handled: FTS5
-  indexes over another table are rebuilt, FTS5 tables that keep their own text are copied with
-  their rowids, and contentless ones are reported as coming back empty.
+  every value comes back exactly. Virtual tables are handled: FTS5 indexes over another table are
+  rebuilt, FTS5 tables that keep their own text are copied with their rowids, and contentless ones
+  are reported as coming back empty.
+- **One moment, a page at a time when it must be.** A dump first asks how many characters each
+  table's rows come to. Up to 12 million, it reads them all in one call, which is one moment: a
+  D1 batch is one transaction, and a Durable Object's reads are synchronous. Past that, one call
+  can't hold them: a Durable Object answers at most 32 MiB over RPC, and D1 refused a 66 MB batch
+  ("exceeded the maximum response size limit of 50 MB", whether it held one statement or four).
+  So the dump reads small tables together and large ones a page at a time by rowid, about 12
+  million characters a call, and writes each page out before it reads the next. Every call also
+  reads `total_changes()`, which any write on the database's connection moves and a read doesn't,
+  in D1 and in a Durable Object alike (checked on Cloudflare). A dump whose calls don't all agree
+  starts over, up to three tries. The last one goes on regardless and says, in its head line, that
+  it wasn't read at one moment. A restart of the database resets the counter, which only makes a
+  dump start over.
 
 ### Worker
 
@@ -74,8 +85,8 @@ rest of this section is still to come where it says so.
 - **An app's objects make one snapshot.** The Workflow lists them in one step, dumps 20 to a step,
   so a retry redoes 20 rather than all of them, and commits one manifest with a dump per object at
   `objects/<name>.jsonl`. One deleted after the list was made is left out. Each dump is one
-  consistent read of its object; the snapshot isn't one moment across objects, which each stand
-  alone.
+  moment of its object, read as SQLite dumps are; the snapshot isn't one moment across objects,
+  which each stand alone.
 - **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
   prune, test when due, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
@@ -146,6 +157,11 @@ rest of this section is still to come where it says so.
 - **Restore tests in a Durable Object, not in memory.** A WebAssembly SQLite in the Worker would
   keep everything in memory, but it isn't the SQLite D1 runs, with D1's limits. A Durable Object's
   is, so a statement D1 would refuse fails the test too, and rolling the rows back keeps the data out
-  of its storage.
-- **One consistent read where possible.** D1's batch is a transaction, so a dump that fits in one
-  batch is a true snapshot. Larger databases will need a paged mode, which says it isn't one.
+  of its storage. The rows go in inside one synchronous transaction, which can't wait for the
+  bucket, so the test reads the dump first and holds it once, as the chunks it was stored in,
+  turning one line at a time into SQL.
+- **Pages checked by `total_changes()`, not one read streamed out of the app.** An app's object
+  could read everything at one moment and stream it out, past the 32 MiB a call returns, but it
+  would hold the whole dump in memory beside its own work, and an object that runs out of memory
+  is reset under the people using it. Pages keep what it holds to one page, and the counter tells
+  when they saw different moments.

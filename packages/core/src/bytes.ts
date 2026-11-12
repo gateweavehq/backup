@@ -52,3 +52,41 @@ export function fromBase64Url(text: string): Uint8Array<ArrayBuffer> {
 export async function sha256Hex(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
 	return toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
 }
+
+interface DigestStreamLike extends WritableStream<Uint8Array> {
+	readonly digest: Promise<ArrayBuffer>;
+}
+
+/**
+ * SHA-256 over bytes that arrive in pieces. Workers have a streaming digest, `crypto.DigestStream`,
+ * so a file is hashed as it goes by and never held whole for it. Elsewhere, as in Node, Web Crypto
+ * has none, so the pieces are kept and hashed at the end.
+ */
+export class Sha256 {
+	readonly #stream: DigestStreamLike | undefined;
+	readonly #writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
+	readonly #parts: Uint8Array[] = [];
+
+	constructor() {
+		const DigestStream = (
+			crypto as unknown as { DigestStream?: new (algorithm: string) => DigestStreamLike }
+		).DigestStream;
+		if (DigestStream) {
+			this.#stream = new DigestStream("SHA-256");
+			this.#writer = this.#stream.getWriter();
+		}
+	}
+
+	async update(part: Uint8Array): Promise<void> {
+		if (this.#writer) await this.#writer.write(part);
+		else this.#parts.push(part);
+	}
+
+	async digest(): Promise<string> {
+		if (this.#writer && this.#stream) {
+			await this.#writer.close();
+			return toHex(new Uint8Array(await this.#stream.digest));
+		}
+		return sha256Hex(concat(...this.#parts));
+	}
+}

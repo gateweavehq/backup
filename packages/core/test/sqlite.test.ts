@@ -1,7 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
+import { utf8 } from "../src/bytes";
 import {
 	DumpError,
+	DumpLines,
 	describeStatement,
 	dumpSqlite,
 	ftsContent,
@@ -194,7 +196,8 @@ describe("SQLite dumps", () => {
 		};
 		const dump = await dumpSqlite(changing);
 		expect(dump.lines.some((l) => l.includes('"name":"late"'))).toBe(true);
-		expect(rounds).toBe(6);
+		// The first try saw the change in its third call, the sizes; the second made all four.
+		expect(rounds).toBe(7);
 	});
 
 	it("give up when the schema never settles", async () => {
@@ -270,6 +273,144 @@ describe("restoring a dump", () => {
 	it("survives a round trip through one file", async () => {
 		const lines = (await dumpSqlite(reader(sample()))).lines;
 		expect(splitLines(joinLines(lines))).toEqual(lines);
+	});
+});
+
+describe("a dump read from its chunks", () => {
+	/** Bytes cut where `cuts` say, as a repository's chunks are. */
+	function cutAt(bytes: Uint8Array, cuts: number[]): Uint8Array[] {
+		const chunks: Uint8Array[] = [];
+		let from = 0;
+		for (const at of [...cuts, bytes.length]) {
+			chunks.push(bytes.subarray(from, at));
+			from = at;
+		}
+		return chunks;
+	}
+
+	it("has the lines splitLines finds, wherever the chunks are cut", () => {
+		const texts = [
+			'{"v":"Grüße, 🙂 ışık"}\n\n{"v":"ğ"}\n',
+			'{"v":"ç"}\n{"v":"no line break at the end 🙂"}',
+			"\n",
+			"",
+		];
+		for (const text of texts) {
+			const bytes = utf8(text);
+			// One cut at every byte, a character's middle included, and every byte its own chunk.
+			for (let at = 0; at <= bytes.length; at++) {
+				expect([...new DumpLines(cutAt(bytes, [at]))], `${text} at ${at}`).toEqual(
+					splitLines(text),
+				);
+			}
+			const everyByte = Array.from({ length: bytes.length }, (_, i) => i);
+			expect([...new DumpLines(cutAt(bytes, everyByte))]).toEqual(splitLines(text));
+		}
+		expect([...new DumpLines([])]).toEqual([]);
+	});
+
+	it("restores as the lines themselves do, and can be read again", async () => {
+		const lines = (await dumpSqlite(reader(sample()))).lines;
+		const bytes = utf8(joinLines(lines));
+		const cuts = Array.from({ length: 40 }, (_, i) => Math.floor((bytes.length * i) / 40));
+		const chunked = new DumpLines(cutAt(bytes, cuts));
+		expect([...restoreSql(chunked)]).toEqual([...restoreSql(lines)]);
+		expect([...chunked]).toEqual(lines);
+	});
+
+	it("names the line that isn't UTF-8", () => {
+		const bad = Uint8Array.from([...utf8('{"k":"head"}\n{"v":"'), 0xff, ...utf8('"}\n')]);
+		expect(() => [...new DumpLines([bad])]).toThrow(
+			new DumpError("Line 2 of the dump is not UTF-8."),
+		);
+	});
+});
+
+describe("a dump read a page at a time", () => {
+	/** A reader that keeps each call's statements, and may change the database after one. */
+	function counting(db: DatabaseSync, after?: (call: number) => void) {
+		const calls: string[][] = [];
+		const read: SqlReader = {
+			async readTogether(statements) {
+				calls.push(statements);
+				const rows = statements.map((sql) => db.prepare(sql).all() as Row[]);
+				after?.(calls.length);
+				return rows;
+			},
+		};
+		return { read, calls };
+	}
+
+	/** The sample with more issues, so that a table takes pages. */
+	function larger(): DatabaseSync {
+		const db = sample();
+		const issue = db.prepare("INSERT INTO issue (title, body) VALUES (?, ?)");
+		for (let i = 0; i < 40; i++) issue.run(`Issue ${i}`, `Body ${i} ${"ğüş 🙂 ".repeat(i % 5)}`);
+		return db;
+	}
+
+	it("has the lines one read has, in calls of about a page", async () => {
+		const whole = await dumpSqlite(reader(larger()));
+		const { read, calls } = counting(larger());
+		const paged = await dumpSqlite(read, { pageChars: 200 });
+		expect(paged.lines).toEqual(whole.lines);
+		expect(paged.stats).toEqual({ ...whole.stats, consistent: true });
+		const pages = calls.filter((statements) => statements.some((sql) => sql.includes("LIMIT")));
+		expect(pages.length).toBeGreaterThan(5);
+		// Each call reads the change counter, so a write in between shows.
+		for (const statements of calls.slice(2))
+			expect(statements).toContain("SELECT total_changes() AS t");
+		expect(restore(paged.lines).prepare("SELECT count(*) AS n FROM issue").get()).toEqual({
+			n: 42,
+		});
+	});
+
+	it("reads a small database in one call, as before", async () => {
+		const { read, calls } = counting(sample());
+		const dump = await dumpSqlite(read, { pageChars: 1_000_000 });
+		expect(dump.lines).toEqual((await dumpSqlite(reader(sample()))).lines);
+		// The plan's two, the sizes, then every row at once.
+		expect(calls).toHaveLength(4);
+	});
+
+	it("starts over when the database changes between pages", async () => {
+		const db = larger();
+		const { read, calls } = counting(db, (call) => {
+			if (call === 5)
+				db.prepare("INSERT INTO issue (title, body) VALUES ('late', 'a page late')").run();
+		});
+		const dump = await dumpSqlite(read, { pageChars: 200 });
+		expect(dump.lines.filter((text) => text.includes("a page late"))).toHaveLength(1);
+		// The first try stopped at its next call, and the second read everything again.
+		expect(
+			calls.filter((statements) => statements[0]?.startsWith("SELECT type, name")).length,
+		).toBeGreaterThan(2);
+		expect(dump.stats.consistent).toBe(true);
+		expect(JSON.parse(dump.lines[0] ?? "")).toMatchObject({ k: "head", consistent: true });
+	});
+
+	it("says so when the database never stops changing", async () => {
+		const db = larger();
+		let n = 0;
+		const { read } = counting(db, () => {
+			db.prepare("INSERT INTO event (what) VALUES (?)").run(`busy ${n++}`);
+		});
+		const dump = await dumpSqlite(read, { pageChars: 200 });
+		expect(dump.stats.consistent).toBe(false);
+		expect(JSON.parse(dump.lines[0] ?? "")).toMatchObject({ k: "head", consistent: false });
+		// Still a whole dump: it restores, with the rows each page saw.
+		expect(restore(dump.lines).prepare("SELECT count(*) AS n FROM issue").get()).toEqual({ n: 42 });
+	});
+
+	it("refuses a table too large for a page that has no rowid to page by", async () => {
+		const db = sample();
+		const odd = db.prepare(`INSERT INTO "odd ""name""" VALUES (?, ?)`);
+		for (let i = 0; i < 30; i++) odd.run(`key ${i}`, "a value that takes some room");
+		await expect(dumpSqlite(reader(db), { pageChars: 200 })).rejects.toThrow(
+			new DumpError(
+				'odd "name" is too large to read at once, and has no rowid to read it a page at a time.',
+			),
+		);
 	});
 });
 

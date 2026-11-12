@@ -1,9 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import {
 	DumpError,
+	DumpLines,
 	type DumpSummary,
 	describeStatement,
-	fromUtf8,
 	ident,
 	isDumpFile,
 	objectOf,
@@ -11,7 +11,6 @@ import {
 	RepositoryError,
 	restoreSql,
 	SealError,
-	splitLines,
 	summarizeDump,
 } from "@gateweave/backup-core";
 import { R2Store } from "./bindings";
@@ -105,8 +104,9 @@ export class RestoreTest extends DurableObject<Env> {
 				continue;
 			}
 			try {
-				// The whole dump is in memory a few times over while it loads: see docs/deploy.md.
-				const lines = splitLines(fromUtf8(await repo.readWholeFile(entry)));
+				// The dump is held once, as the chunks it was stored in, and read a line at a time: the
+				// rows must go in inside one synchronous transaction, so they can't wait for the bucket.
+				const lines = new DumpLines(await repo.readFileChunks(entry));
 				result.size += entry.size;
 				const summary = summarizeDump(lines);
 				if (loaded > 0) await this.ctx.storage.deleteAll();
@@ -129,7 +129,7 @@ export class RestoreTest extends DurableObject<Env> {
 	}
 
 	/** Restores the dump, checks what came back, and rolls the rows back. */
-	#load(lines: string[], summary: DumpSummary): void {
+	#load(lines: DumpLines, summary: DumpSummary): void {
 		const sql = this.ctx.storage.sql;
 		const run = (statement: string) => {
 			try {

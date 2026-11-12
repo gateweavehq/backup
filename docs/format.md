@@ -100,6 +100,10 @@ digits, dots, dashes and underscores, starting with a letter or digit, so it is 
 name. Its `meta` counts them all: `{"objects": 3, "tables": 69, "rows": 1840, "empty": []}`, where
 `empty` names a contentless table as `<object>/<table>`.
 
+A dump that couldn't be read at one moment, because its database kept changing while it was read a
+page at a time, says so in its head line, and the `meta` says so too: `"consistent": false` for a
+single database, or `"inconsistent"` with the names of such objects. Neither appears otherwise.
+
 ## SQLite dumps
 
 D1 and Durable Object databases are dumped to `database.jsonl`: one JSON object per line, in this

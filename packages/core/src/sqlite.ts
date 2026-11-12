@@ -1,10 +1,13 @@
 /**
  * SQLite dumps, for D1 and Durable Object databases: docs/format.md, "SQLite dumps".
  *
- * A dump reads in two rounds. The first learns the schema; the second reads every row, together
- * with the schema again, as one consistent read (a D1 batch, or synchronous calls inside a Durable
- * Object). If the schema changed between the rounds, the dump starts over.
+ * A dump reads in two rounds. The first learns the schema and how large the tables are; the second
+ * reads every row, together with the schema again, as one consistent read (a D1 batch, or
+ * synchronous calls inside a Durable Object), or a page at a time when the rows are too many for
+ * one. If the schema changed between the rounds, the dump starts over.
  */
+
+import { concat, fromUtf8 } from "./bytes";
 
 /** The file a SQLite source's snapshot holds its dump in. */
 export const DUMP_FILE = "database.jsonl";
@@ -56,6 +59,8 @@ export interface DumpStats {
 	rows: number;
 	/** Contentless FTS5 tables, which come back empty. */
 	empty: string[];
+	/** Whether every row was read at the same moment, as the dump's head says. */
+	consistent: boolean;
 }
 
 export interface Dump {
@@ -171,71 +176,277 @@ async function plan(reader: SqlReader): Promise<{ plan: Plan; schema: string }> 
 	};
 }
 
-/** One statement that reads a table's rows as SQL literals, joined by commas. */
-function rowsQuery(
-	name: string,
-	cols: string[],
-	{ rowid, order }: { rowid: boolean; order: boolean },
-) {
-	const values = [...(rowid ? ["rowid"] : []), ...cols].map((c) =>
-		c === "rowid" ? "quote(rowid)" : `quote(${ident(c)})`,
-	);
-	return `SELECT ${values.join(" || ',' || ")} AS v FROM ${ident(name)}${order ? " ORDER BY rowid" : ""}`;
+/**
+ * The most a dump reads in one call, in characters of its rows' SQL literals. A Durable Object's
+ * answer over RPC may be 32 MiB at most and a D1 batch's 50 MB, and a character past Latin-1 can
+ * take two bytes on the way. A database with more is read a page at a time.
+ */
+export const PAGE_CHARS = 12_000_000;
+
+/** How many rows the database's connection has changed: the same before and after a quiet read. */
+const CHANGES = "SELECT total_changes() AS t";
+const SEQUENCES = "SELECT name, seq FROM sqlite_sequence ORDER BY name";
+
+/** The most statements one call sends. The apps' Backup entrypoints take up to 1,000. */
+const STATEMENTS = 500;
+
+export interface DumpOptions {
+	/**
+	 * Whether the reader reads all the statements of one call at one moment, as D1's batches and
+	 * Durable Objects do. The default.
+	 */
+	consistent?: boolean;
+	/** The most one call reads, in characters: PAGE_CHARS unless a test wants pages sooner. */
+	pageChars?: number;
+}
+
+/** A table whose rows a dump reads, as `rowsQuery` and `pageQuery` read it. */
+interface Readable {
+	name: string;
+	cols: string[];
+	/** Whether its rowid is one of the values, as an FTS5 table that keeps its own text needs. */
+	rowid: boolean;
+	/** Whether a whole read orders it by rowid. */
+	order: boolean;
+	/** Whether it has a rowid to read it by a page at a time. */
+	pageable: boolean;
+}
+
+/** The tables whose rows a dump holds, in its order: the plain tables, then the own-text FTS. */
+function readables(p: Plan): Readable[] {
+	return [
+		...p.tables.map((t) => ({
+			name: t.name,
+			cols: t.cols,
+			rowid: false,
+			order: !t.withoutRowid,
+			pageable: !t.withoutRowid,
+		})),
+		// An FTS5 table that keeps its own text is restored by inserting it, rowid included, so
+		// that the rowids other tables may hold still match.
+		...p.virtuals
+			.filter((v) => v.content === "own")
+			.map((v) => ({ name: v.name, cols: v.cols, rowid: v.fts5, order: false, pageable: v.fts5 })),
+	];
+}
+
+/** A table's row as SQL literals, joined by commas. */
+function valuesOf(t: Readable): string {
+	return [...(t.rowid ? ["rowid"] : []), ...t.cols]
+		.map((c) => (c === "rowid" ? "quote(rowid)" : `quote(${ident(c)})`))
+		.join(" || ',' || ");
+}
+
+/** One statement that reads all of a table's rows. */
+function rowsQuery(t: Readable): string {
+	return `SELECT ${valuesOf(t)} AS v FROM ${ident(t.name)}${t.order ? " ORDER BY rowid" : ""}`;
+}
+
+/** How many rows a table has, and how many characters they come to. */
+function sizeQuery(t: Readable): string {
+	return `SELECT count(*) AS n, coalesce(sum(length(${valuesOf(t)})), 0) AS c FROM ${ident(t.name)}`;
+}
+
+/** Up to `limit` of a table's rows after the rowid `after`, each with its rowid. */
+function pageQuery(t: Readable, after: string | undefined, limit: number): string {
+	const where = after === undefined ? "" : ` WHERE rowid > ${after}`;
+	return `SELECT quote(rowid) AS r, ${valuesOf(t)} AS v FROM ${ident(t.name)}${where} ORDER BY rowid LIMIT ${limit}`;
+}
+
+function rowidOf(value: unknown): string {
+	const text = String(value);
+	if (!/^-?\d{1,20}$/.test(text))
+		throw new DumpError("A page came back with a rowid that isn't one.");
+	return text;
+}
+
+function changesOf(rows: Row[] | undefined): number {
+	return Number(rows?.[0]?.t);
+}
+
+/** The database changed while it was read a page at a time, so the dump starts over. */
+class Changed extends Error {}
+
+const line = (value: Record<string, unknown>) => JSON.stringify(value);
+
+function* headLines(p: Plan, consistent: boolean): Generator<string> {
+	yield line({ k: "head", format: "sqlite-jsonl", version: 1, consistent });
+	for (const t of p.tables) yield line({ k: "table", name: t.name, sql: t.sql, cols: t.cols });
+	for (const v of p.virtuals) {
+		const cols = v.content === "own" && v.fts5 ? ["rowid", ...v.cols] : v.cols;
+		yield line({ k: "virtual", name: v.name, sql: v.sql, cols, content: v.content });
+	}
+}
+
+function* tailLines(p: Plan, sequences: Row[], rows: number): Generator<string> {
+	for (const row of sequences)
+		yield line({ k: "seq", name: String(row.name), seq: Number(row.seq) });
+	for (const object of p.after) yield line({ k: object.type, name: object.name, sql: object.sql });
+	for (const v of p.virtuals) {
+		if (v.fts5 && v.content === "external") yield line({ k: "rebuild", t: v.name });
+	}
+	yield line({ k: "end", tables: p.tables.length + p.virtuals.length, rows });
 }
 
 /**
- * Dumps a database through `reader`. The lines are docs/format.md's `database.jsonl`. `consistent`
- * says whether the reader reads all its statements at one moment, which D1's batches and Durable
- * Objects' synchronous storage do.
+ * Dumps a database through `reader`. The lines are docs/format.md's `database.jsonl`.
  */
-export async function dumpSqlite(
+export async function dumpSqlite(reader: SqlReader, options: DumpOptions = {}): Promise<Dump> {
+	const lines: string[] = [];
+	const { stats } = await dumpSqliteTo(
+		reader,
+		async (all) => {
+			lines.length = 0;
+			for await (const text of all) lines.push(text);
+		},
+		options,
+	);
+	return { lines, stats };
+}
+
+/**
+ * Dumps a database through `reader`, giving its lines to `write` as they are read, so a large
+ * database is never held whole: docs/format.md, "SQLite dumps". `write` may be called again, with
+ * the dump from the start, when the database changed while it was read a page at a time.
+ *
+ * A database whose rows come to PAGE_CHARS or less is read in one call, at one moment. A larger one
+ * is read in calls of about PAGE_CHARS: its small tables together, a large one a page at a time by
+ * rowid. Every call also reads `total_changes()`, which any write moves, so a dump whose calls
+ * don't all agree starts over. The last of its tries goes on regardless, and says it wasn't read
+ * at one moment.
+ */
+export async function dumpSqliteTo<T>(
 	reader: SqlReader,
-	{ consistent = true }: { consistent?: boolean } = {},
-): Promise<Dump> {
+	write: (lines: AsyncIterable<string>) => Promise<T>,
+	{ consistent = true, pageChars = PAGE_CHARS }: DumpOptions = {},
+): Promise<{ written: T; stats: DumpStats }> {
 	for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
 		const { plan: p, schema } = await plan(reader);
-		const ownVirtuals = p.virtuals.filter((v) => v.content === "own");
-		const statements = [
-			SCHEMA,
-			...p.tables.map((t) => rowsQuery(t.name, t.cols, { rowid: false, order: !t.withoutRowid })),
-			// An FTS5 table that keeps its own text is restored by inserting it, rowid included, so
-			// that the rowids other tables may hold still match.
-			...ownVirtuals.map((v) => rowsQuery(v.name, v.cols, { rowid: v.fts5, order: false })),
-			...(p.hasSequence ? ["SELECT name, seq FROM sqlite_sequence ORDER BY name"] : []),
-		];
-		const results = await reader.readTogether(statements);
-		if (JSON.stringify(asSchema(results[0] ?? [])) !== schema) continue;
-
-		const lines: string[] = [];
-		const line = (value: Record<string, unknown>) => lines.push(JSON.stringify(value));
-		let rows = 0;
-		line({ k: "head", format: "sqlite-jsonl", version: 1, consistent });
-		for (const t of p.tables) line({ k: "table", name: t.name, sql: t.sql, cols: t.cols });
-		for (const v of p.virtuals) {
-			const cols = v.content === "own" && v.fts5 ? ["rowid", ...v.cols] : v.cols;
-			line({ k: "virtual", name: v.name, sql: v.sql, cols, content: v.content });
+		const readable = readables(p);
+		const sized = await reader.readTogether([SCHEMA, CHANGES, ...readable.map(sizeQuery)]);
+		if (JSON.stringify(asSchema(sized[0] ?? [])) !== schema) continue;
+		const sizes = readable.map((_, i) => ({
+			rows: Number(sized[i + 2]?.[0]?.n ?? 0),
+			chars: Number(sized[i + 2]?.[0]?.c ?? 0),
+		}));
+		const stats: DumpStats = {
+			tables: p.tables.length + p.virtuals.length,
+			rows: 0,
+			empty: p.virtuals.filter((v) => v.content === "none").map((v) => v.name),
+			consistent,
+		};
+		let lines: AsyncGenerator<string>;
+		if (sizes.reduce((sum, size) => sum + size.chars, 0) <= pageChars) {
+			const results = await reader.readTogether([
+				SCHEMA,
+				...readable.map(rowsQuery),
+				...(p.hasSequence ? [SEQUENCES] : []),
+			]);
+			if (JSON.stringify(asSchema(results[0] ?? [])) !== schema) continue;
+			lines = wholeLines(p, readable, results, stats);
+		} else {
+			stats.consistent = consistent && attempt < ATTEMPTS;
+			const read = { reader, schema, changes: changesOf(sized[1]), pageChars };
+			lines = pagedLines(p, readable, sizes, read, stats);
 		}
-		let at = 1;
-		for (const t of [...p.tables, ...ownVirtuals]) {
-			for (const row of results[at] ?? []) {
-				line({ k: "row", t: t.name, v: String(row.v) });
-				rows++;
-			}
-			at++;
+		try {
+			return { written: await write(lines), stats };
+		} catch (error) {
+			if (error instanceof Changed) continue;
+			throw error;
 		}
-		if (p.hasSequence) {
-			for (const row of results[at] ?? [])
-				line({ k: "seq", name: String(row.name), seq: Number(row.seq) });
-		}
-		for (const object of p.after) line({ k: object.type, name: object.name, sql: object.sql });
-		for (const v of p.virtuals) {
-			if (v.fts5 && v.content === "external") line({ k: "rebuild", t: v.name });
-		}
-		line({ k: "end", tables: p.tables.length + p.virtuals.length, rows });
-		const empty = p.virtuals.filter((v) => v.content === "none").map((v) => v.name);
-		return { lines, stats: { tables: p.tables.length + p.virtuals.length, rows, empty } };
 	}
-	throw new DumpError(`The schema kept changing during the dump, ${ATTEMPTS} times.`);
+	throw new DumpError(`The database kept changing during the dump, ${ATTEMPTS} times.`);
+}
+
+/** The lines of a dump read in one call, each row let go as soon as its line is made. */
+async function* wholeLines(
+	p: Plan,
+	readable: Readable[],
+	results: Row[][],
+	stats: DumpStats,
+): AsyncGenerator<string> {
+	yield* headLines(p, stats.consistent);
+	for (const [i, t] of readable.entries()) {
+		// Taken from the end of a reversed list, so each row can go as soon as its line is made.
+		const left = (results[i + 1] ?? []).reverse();
+		results[i + 1] = [];
+		for (let row = left.pop(); row !== undefined; row = left.pop()) {
+			stats.rows++;
+			yield line({ k: "row", t: t.name, v: String(row.v) });
+		}
+	}
+	yield* tailLines(p, p.hasSequence ? (results[readable.length + 1] ?? []) : [], stats.rows);
+}
+
+/** The lines of a dump read a page at a time, checked as they come when `stats.consistent`. */
+async function* pagedLines(
+	p: Plan,
+	readable: Readable[],
+	sizes: { rows: number; chars: number }[],
+	read: { reader: SqlReader; schema: string; changes: number; pageChars: number },
+	stats: DumpStats,
+): AsyncGenerator<string> {
+	const { reader, pageChars } = read;
+	const check = (rows: Row[] | undefined) => {
+		if (stats.consistent && changesOf(rows) !== read.changes) throw new Changed();
+	};
+	let group: Readable[] = [];
+	let groupChars = 0;
+	async function* readGroup(): AsyncGenerator<string> {
+		if (group.length === 0) return;
+		const tables = group;
+		group = [];
+		groupChars = 0;
+		const results = await reader.readTogether([...tables.map(rowsQuery), CHANGES]);
+		check(results[tables.length]);
+		for (const [i, t] of tables.entries()) {
+			for (const row of results[i] ?? []) {
+				stats.rows++;
+				yield line({ k: "row", t: t.name, v: String(row.v) });
+			}
+		}
+	}
+
+	yield* headLines(p, stats.consistent);
+	for (const [i, t] of readable.entries()) {
+		const size = sizes[i] ?? { rows: 0, chars: 0 };
+		if (size.chars <= pageChars) {
+			if (groupChars + size.chars > pageChars || group.length >= STATEMENTS) yield* readGroup();
+			group.push(t);
+			groupChars += size.chars;
+			continue;
+		}
+		yield* readGroup();
+		if (!t.pageable) {
+			throw new DumpError(
+				`${t.name} is too large to read at once, and has no rowid to read it a page at a time.`,
+			);
+		}
+		// As many rows as come to pageChars on average; a page of longer ones is longer.
+		const limit = Math.max(1, Math.floor((pageChars * size.rows) / size.chars));
+		let after: string | undefined;
+		for (;;) {
+			const [page = [], counted] = await reader.readTogether([pageQuery(t, after, limit), CHANGES]);
+			check(counted);
+			for (const row of page) {
+				stats.rows++;
+				after = rowidOf(row.r);
+				yield line({ k: "row", t: t.name, v: String(row.v) });
+			}
+			if (page.length < limit) break;
+		}
+	}
+	yield* readGroup();
+	const [schemaRows = [], counted, sequences = []] = await reader.readTogether([
+		SCHEMA,
+		CHANGES,
+		...(p.hasSequence ? [SEQUENCES] : []),
+	]);
+	// The indexes, triggers and views come from the plan, so a schema that changed starts over.
+	if (JSON.stringify(asSchema(schemaRows)) !== read.schema) throw new Changed();
+	check(counted);
+	yield* tailLines(p, sequences, stats.rows);
 }
 
 type Line =
@@ -260,7 +471,7 @@ function parseLine(text: string, number: number): Line {
  * makes unique, and SQLite refuses a row for it until that index exists ("foreign key mismatch"),
  * even with checks deferred. D1 always checks foreign keys, so these are made before the rows.
  */
-function uniqueIndexes(lines: readonly string[]): Map<string, string> {
+function uniqueIndexes(lines: Iterable<string>): Map<string, string> {
 	const found = new Map<string, string>();
 	for (const text of lines) {
 		// Rows are nearly all of a dump, and never an index.
@@ -416,7 +627,9 @@ function* longRow(table: string, cols: string, values: string, parts: string): G
  * transaction it can roll back.
  */
 export function* restoreSql(lines: Iterable<string>): Generator<string> {
-	const all = Array.isArray(lines) ? (lines as readonly string[]) : [...lines];
+	// Read twice, for the unique indexes first. An array or DumpLines starts over; other lines are
+	// kept as they are read.
+	const all = Array.isArray(lines) || lines instanceof DumpLines ? lines : [...lines];
 	const unique = uniqueIndexes(all);
 	const columnsOf = new Map<string, string>();
 	let number = 0;
@@ -509,12 +722,14 @@ export interface DumpSummary {
 }
 
 /** What a dump holds: its tables and how many rows each has. Names and counts, never values. */
-export function summarizeDump(lines: readonly string[]): DumpSummary {
+export function summarizeDump(lines: Iterable<string>): DumpSummary {
 	const summary: DumpSummary = { consistent: false, tables: [], rows: 0 };
 	const byName = new Map<string, TableSummary>();
 	let ended = false;
-	lines.forEach((text, index) => {
-		if (text.trim() === "") return;
+	let index = -1;
+	for (const text of lines) {
+		index++;
+		if (text.trim() === "") continue;
 		let line: { k?: unknown; name?: unknown; t?: unknown; consistent?: unknown };
 		try {
 			line = JSON.parse(text);
@@ -533,7 +748,7 @@ export function summarizeDump(lines: readonly string[]): DumpSummary {
 			table.rows++;
 			summary.rows++;
 		} else if (line.k === "end") ended = true;
-	});
+	}
 	if (!ended) throw new DumpError("The dump stops before its end: it is incomplete.");
 	return summary;
 }
@@ -573,4 +788,42 @@ export function splitLines(text: string): string[] {
 	const lines = text.split("\n");
 	if (lines.at(-1) === "") lines.pop();
 	return lines;
+}
+
+/**
+ * A dump's lines, as `splitLines` reads them, but from the UTF-8 bytes it was stored in, chunk by
+ * chunk, and decoded one line at a time. So a large dump is held once, as bytes, rather than as
+ * bytes, one string and its lines. It reads from the start each time, as `restoreSql` needs.
+ */
+export class DumpLines implements Iterable<string> {
+	readonly #chunks: readonly Uint8Array[];
+
+	constructor(chunks: readonly Uint8Array[]) {
+		this.#chunks = chunks;
+	}
+
+	*[Symbol.iterator](): Generator<string> {
+		let number = 0;
+		const decode = (bytes: Uint8Array) => {
+			number++;
+			try {
+				return fromUtf8(bytes);
+			} catch {
+				throw new DumpError(`Line ${number} of the dump is not UTF-8.`);
+			}
+		};
+		// The start of a line that goes on in the next chunk.
+		let carried: Uint8Array[] = [];
+		for (const chunk of this.#chunks) {
+			let at = 0;
+			for (let end = chunk.indexOf(0x0a); end >= 0; end = chunk.indexOf(0x0a, at)) {
+				const part = chunk.subarray(at, end);
+				yield decode(carried.length > 0 ? concat(...carried, part) : part);
+				carried = [];
+				at = end + 1;
+			}
+			if (at < chunk.length) carried.push(chunk.subarray(at));
+		}
+		if (carried.length > 0) yield decode(concat(...carried));
+	}
 }

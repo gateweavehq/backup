@@ -27,8 +27,8 @@ the same account.
    as a secret, and nothing else holds it.
 3. **One copy outside Cloudflare.** The 3-2-1 rule: three copies, on two kinds of storage, one
    elsewhere. A locked R2 bucket plus an S3-compatible bucket at another provider.
-4. **Never restore over live data.** A restore goes to a new database or bucket, with a preview of
-   what is in it.
+4. **Never restore over live data.** A restore goes to a new database, or into a bucket only where
+   a key is free, with a preview of what is in it.
 5. **A backup that wasn't restored isn't known to work.** A monthly restore test is part of the
    product, and its date is shown next to every source.
 
@@ -156,6 +156,13 @@ retention; the rest of this section is still to come where it says so.
 - **An object at a time.** A snapshot of an app's Durable Objects restores to a file per object,
   `<object>.sql` or `<object>.sqlite`, or to the one `--object` names, since one workspace is what
   someone usually needs back.
+- **Into a bucket, only where a key is free.** A snapshot of a bucket goes back with `--to s3://`,
+  through a store of its own that only creates: each PutObject carries `If-None-Match: *` and is
+  signed with the object's SHA-256, so the bucket refuses a taken key and bytes that don't match.
+  `--prefix` picks the objects, such as one workspace's files. It writes with node:http, since fetch
+  adds `Cache-Control: no-cache` to a conditional request and R2 would keep it on the object. R2
+  keeps custom metadata names that come through the S3 API in lower case (measured 2026-11-12), so
+  the CLI says which names lost their capitals.
 
 ## Decisions
 

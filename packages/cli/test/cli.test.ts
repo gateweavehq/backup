@@ -1,5 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -15,14 +17,20 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
+	BUCKET_INDEX,
+	type BucketObject,
+	bucketFile,
 	dumpSqlite,
+	type FileEntry,
 	generateMasterKey,
 	joinLines,
+	type Manifest,
 	MemoryStore,
 	objectFile,
 	Repository,
 	type Row,
 	utf8,
+	writeBucketIndex,
 } from "@gateweave/backup-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { HELP, type Io, run } from "../src/cli";
@@ -651,6 +659,344 @@ describe("an S3-compatible bucket", () => {
 		});
 		expect(ran.code).toBe(1);
 		expect(ran.err).toContain("--endpoint or AWS_ENDPOINT_URL");
+	});
+});
+
+interface Sample {
+	object: Omit<BucketObject, "size">;
+	bytes: Uint8Array<ArrayBuffer>;
+}
+
+function noise(size: number): Uint8Array<ArrayBuffer> {
+	const bytes = new Uint8Array(size);
+	for (let at = 0; at < size; at += 65_536) {
+		crypto.getRandomValues(bytes.subarray(at, Math.min(size, at + 65_536)));
+	}
+	return bytes;
+}
+
+const UPLOADED = "2026-11-01T10:00:00.000Z";
+const BUCKET: Sample[] = [
+	{
+		object: {
+			key: "ws-1/f-1/report.pdf",
+			etag: "e1",
+			uploaded: UPLOADED,
+			http: {
+				contentType: "application/pdf",
+				contentDisposition: 'attachment; filename="report.pdf"',
+				cacheControl: "max-age=60",
+				cacheExpiry: "2026-12-01T00:00:00.000Z",
+			},
+			custom: { uploadedBy: "user-1" },
+		},
+		// Many chunks, so the body goes out in many writes.
+		bytes: noise(50_000),
+	},
+	{
+		object: {
+			key: "ws-1/f-2/naïve notes.txt",
+			etag: "e2",
+			uploaded: UPLOADED,
+			http: { contentType: "text/plain; charset=utf-8", contentLanguage: "tr" },
+			custom: { note: "çok güzel", plain: "=?not encoded?=" },
+		},
+		bytes: utf8("merhaba dünya\n"),
+	},
+	{
+		object: { key: "ws-2/f-3/empty", etag: "e3", uploaded: UPLOADED, http: {}, custom: {} },
+		bytes: new Uint8Array(0),
+	},
+];
+
+/** A repository holding one snapshot of a bucket, copied to a folder of its own. */
+async function bucketRepository(samples: Sample[]) {
+	const objects = new MemoryStore();
+	const repo = await Repository.init(objects, KEY, { chunker: { min: 256, avg: 1024, max: 4096 } });
+	const entries: FileEntry[] = [];
+	const listed: BucketObject[] = [];
+	for (const { object, bytes } of samples) {
+		entries.push((await repo.writeFile(bucketFile(object.key), bytes)).entry);
+		listed.push({ ...object, size: bytes.length });
+	}
+	entries.push((await repo.writeFile(BUCKET_INDEX, writeBucketIndex(listed))).entry);
+	const manifest = await repo.commit({ kind: "r2", name: "track-files" }, entries, {
+		objects: listed.length,
+	});
+	const dir = join(temp, `bucket-${crypto.randomUUID()}`);
+	writeOut(objects, dir);
+	return { dir, manifest };
+}
+
+/** Flips a byte in the chunk of a snapshot's file, in the repository copied to `dir`. */
+function damage(dir: string, entry: FileEntry | undefined, index: number) {
+	const id = entry?.chunks[index];
+	if (!id) throw new Error("No such chunk.");
+	const path = join(dir, "data", id.slice(0, 2), id);
+	const bytes = readFileSync(path);
+	bytes[20] = (bytes[20] ?? 0) ^ 1;
+	writeFileSync(path, bytes);
+}
+
+describe("restoring a snapshot of a bucket", () => {
+	let server: Server;
+	let endpoint: string;
+	let repo: { dir: string; manifest: Manifest };
+	/** What the bucket `live` holds: each object's bytes and the headers it came with. */
+	const live = new Map<string, { bytes: Buffer; headers: [string, string][] }>();
+	const puts: { key: string; status: number; headers: [string, string][] }[] = [];
+	const busy = new Set<string>();
+	const SECRETS: Record<string, string> = { "write-key": "write-secret" };
+
+	beforeAll(async () => {
+		repo = await bucketRepository(BUCKET);
+		server = createServer(async (request, response) => {
+			const answer = (status: number, code?: string) => {
+				response.statusCode = status;
+				response.end(code ? `<Error><Code>${code}</Code></Error>` : undefined);
+			};
+			const parts: Buffer[] = [];
+			try {
+				for await (const part of request) parts.push(part as Buffer);
+			} catch {
+				// The client gave up half way: nothing is stored.
+			}
+			if (!request.complete) return;
+			const body = Buffer.concat(parts);
+			const headers: [string, string][] = [];
+			for (let i = 0; i < request.rawHeaders.length; i += 2) {
+				headers.push([request.rawHeaders[i] ?? "", request.rawHeaders[i + 1] ?? ""]);
+			}
+			// Signed again here from what arrived, over the headers it says it signed, which must be
+			// every x-amz-* one and the body's SHA-256, as R2 checks them.
+			const auth =
+				/^AWS4-HMAC-SHA256 Credential=([^/]+)\/[^,]+, SignedHeaders=([^,]+), Signature=/.exec(
+					request.headers.authorization ?? "",
+				);
+			const secret = SECRETS[auth?.[1] ?? ""];
+			const signed = (auth?.[2] ?? "").split(";");
+			const [rawPath = "/", rawQuery = ""] = (request.url ?? "/").split("?");
+			const amzDate = String(request.headers["x-amz-date"] ?? "");
+			const payload = String(request.headers["x-amz-content-sha256"] ?? "");
+			const unsigned = headers.some(
+				([name]) =>
+					/^(x-amz-|content-|cache-control$|expires$|if-)/i.test(name) &&
+					!signed.includes(name.toLowerCase()),
+			);
+			if (!auth || !secret || unsigned) return answer(403, "AccessDenied");
+			const expected = authorization(
+				{
+					method: request.method ?? "",
+					path: rawPath,
+					query: [...new URLSearchParams(rawQuery)],
+					headers: signed.map((name) => [name, String(request.headers[name] ?? "")]),
+					payloadHash: payload,
+				},
+				{ accessKeyId: auth[1] ?? "", secretAccessKey: secret },
+				"auto",
+				amzDate,
+			);
+			if (request.headers.authorization !== expected) return answer(403, "SignatureDoesNotMatch");
+			if (createHash("sha256").update(body).digest("hex") !== payload) {
+				return answer(400, "XAmzContentSHA256Mismatch");
+			}
+			if (request.method !== "PUT" || !rawPath.startsWith("/live/")) {
+				return answer(405, "MethodNotAllowed");
+			}
+			const key = decodeURIComponent(rawPath.slice("/live/".length));
+			if (busy.delete(key)) return answer(503, "SlowDown");
+			const taken = request.headers["if-none-match"] === "*" && live.has(key);
+			puts.push({ key, status: taken ? 412 : 200, headers });
+			if (taken) return answer(412, "PreconditionFailed");
+			live.set(key, { bytes: body, headers });
+			answer(200);
+		});
+		await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+		endpoint = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+	});
+
+	afterAll(() => {
+		server.close();
+	});
+
+	const env = () => ({
+		GATEWEAVE_BACKUP_KEY: KEY,
+		// The repository's token, which may only read: not the one that writes.
+		AWS_ACCESS_KEY_ID: "read-key",
+		AWS_SECRET_ACCESS_KEY: "read-secret",
+		GATEWEAVE_RESTORE_ENDPOINT_URL: endpoint,
+		GATEWEAVE_RESTORE_ACCESS_KEY_ID: "write-key",
+		GATEWEAVE_RESTORE_SECRET_ACCESS_KEY: "write-secret",
+	});
+	const header = (headers: [string, string][], name: string) =>
+		headers.find(([sent]) => sent === name)?.[1];
+	const word = (text: string) => `=?UTF-8?B?${Buffer.from(text).toString("base64")}?=`;
+
+	it("puts every object back with its bytes and metadata, through PUTs that never replace", async () => {
+		const ran = await cli(["restore", repo.dir, "--to", "s3://live"], { env: env() });
+		expect(ran.err).toBe("");
+		expect(ran.code).toBe(0);
+		for (const { object } of BUCKET) expect(ran.out).toContain(`Put back ${object.key}\n`);
+		expect(ran.out).toMatch(/Snapshot \S+: put back 3 objects, 50 kB, into s3:\/\/live\.\n/);
+		for (const { object, bytes } of BUCKET) {
+			expect(new Uint8Array(live.get(object.key)?.bytes ?? [])).toEqual(bytes);
+		}
+		expect(puts.every((put) => header(put.headers, "if-none-match") === "*")).toBe(true);
+
+		const report = live.get("ws-1/f-1/report.pdf")?.headers ?? [];
+		expect(header(report, "Content-Type")).toBe("application/pdf");
+		expect(header(report, "Content-Disposition")).toBe('attachment; filename="report.pdf"');
+		expect(header(report, "Cache-Control")).toBe("max-age=60");
+		expect(header(report, "Expires")).toBe("Tue, 01 Dec 2026 00:00:00 GMT");
+		// Sent as Track named it, though R2 keeps names in lower case, which the CLI says.
+		expect(header(report, "x-amz-meta-uploadedBy")).toBe("user-1");
+		expect(ran.out).toContain(
+			"The S3 API keeps custom metadata names in lower case, so the bucket has uploadedBy as uploadedby.\n",
+		);
+
+		const notes = live.get("ws-1/f-2/naïve notes.txt")?.headers ?? [];
+		expect(header(notes, "Content-Language")).toBe("tr");
+		expect(header(notes, "x-amz-meta-note")).toBe(word("çok güzel"));
+		// A value that would read as encoded is encoded, so it comes back as it was.
+		expect(header(notes, "x-amz-meta-plain")).toBe(word("=?not encoded?="));
+
+		// Nothing the object didn't have: fetch would add Cache-Control and Pragma to a PUT with
+		// If-None-Match, and R2 would keep them.
+		const empty = live.get("ws-2/f-3/empty")?.headers ?? [];
+		const names = empty.map(([name]) => name.toLowerCase());
+		for (const name of ["cache-control", "pragma", "content-type", "expires"]) {
+			expect(names).not.toContain(name);
+		}
+		expect(names.filter((name) => name.startsWith("x-amz-meta-"))).toEqual([]);
+	});
+
+	it("puts back only what is missing, and leaves every object there as it is", async () => {
+		live.delete("ws-2/f-3/empty");
+		const kept = Buffer.from("someone else's bytes");
+		live.set("ws-1/f-1/report.pdf", { bytes: kept, headers: [] });
+		const ran = await cli(["restore", repo.dir, repo.manifest.name, "--to", "s3://live"], {
+			env: env(),
+		});
+		expect(ran.code).toBe(0);
+		expect(ran.out).toContain("Left ws-1/f-1/report.pdf: there already\n");
+		expect(ran.out).toContain("Put back ws-2/f-3/empty\n");
+		expect(ran.out).toContain(
+			"put back 1 object, 0 B, into s3://live. 2 were there already and left as they are.",
+		);
+		expect(live.get("ws-1/f-1/report.pdf")?.bytes).toEqual(kept);
+	});
+
+	it("picks objects by --prefix, into a folder of the bucket, and tries again when it is busy", async () => {
+		busy.add("restored/ws-1/f-2/naïve notes.txt");
+		const ran = await cli(
+			["restore", repo.dir, "--to", "s3://live/restored", "--prefix", "ws-1/"],
+			{ env: env() },
+		);
+		expect(ran.err).toBe("");
+		expect(ran.code).toBe(0);
+		expect(busy.size).toBe(0);
+		expect([...live.keys()].filter((key) => key.startsWith("restored/")).sort()).toEqual([
+			"restored/ws-1/f-1/report.pdf",
+			"restored/ws-1/f-2/naïve notes.txt",
+		]);
+		expect(ran.out).toContain("into s3://live/restored.");
+	});
+
+	it("writes the objects --prefix picks to a folder, with bucket.json", async () => {
+		const to = join(temp, "bucket-folder");
+		const ran = await cli(["restore", repo.dir, "--to", to, "--prefix", "ws-2/"]);
+		expect(ran.code).toBe(0);
+		expect(readdirSync(to, { recursive: true }).map(String).sort()).toEqual(
+			[
+				"bucket.json",
+				"files",
+				join("files", "ws-2"),
+				join("files", "ws-2", "f-3"),
+				join("files", "ws-2", "f-3", "empty"),
+			].sort(),
+		);
+		const none = await cli(["restore", repo.dir, "--to", join(temp, "none"), "--prefix", "ws-9/"]);
+		expect(none.code).toBe(1);
+		expect(none.err).toContain('holds no object whose key starts with "ws-9/"');
+	});
+
+	it("stops at an object whose chunk was damaged, and the bucket never gets it", async () => {
+		const files = new Map(repo.manifest.files.map((entry) => [entry.path, entry]));
+		const broken = join(temp, `bucket-broken-${crypto.randomUUID()}`);
+		cpSync(repo.dir, broken, { recursive: true });
+		// Half way through the first object's body.
+		damage(broken, files.get("files/ws-1/f-1/report.pdf"), 10);
+		const ran = await cli(["restore", broken, "--to", "s3://live/broken"], { env: env() });
+		expect(ran.code).toBe(1);
+		expect(ran.err).toContain("could not be opened");
+		expect([...live.keys()].filter((key) => key.startsWith("broken/"))).toEqual([]);
+
+		// One put, then the next object fails: the restore says what is there, and run again
+		// once the repository is whole, it puts back the rest.
+		const half = join(temp, `bucket-half-${crypto.randomUUID()}`);
+		cpSync(repo.dir, half, { recursive: true });
+		damage(half, files.get("files/ws-1/f-2/naïve notes.txt"), 0);
+		const stopped = await cli(["restore", half, "--to", "s3://live/half"], { env: env() });
+		expect(stopped.code).toBe(1);
+		expect(stopped.out).toBe("Put back ws-1/f-1/report.pdf\n");
+		expect(stopped.err).toContain(
+			"1 object was put back before that; the same restore again puts back the rest.",
+		);
+		const again = await cli(["restore", repo.dir, "--to", "s3://live/half"], { env: env() });
+		expect(again.out).toContain("put back 2 objects");
+		expect(again.out).toContain("1 was there already and left as it is.");
+	});
+
+	it("refuses metadata the S3 API can't carry, before putting anything", async () => {
+		const odd: Record<string, string>[] = [{ ünï: "x" }, { tag: "a", TAG: "b" }];
+		for (const custom of odd) {
+			const made = await bucketRepository([
+				{ object: { key: "a", etag: "e", uploaded: UPLOADED, http: {}, custom }, bytes: utf8("a") },
+				{
+					object: { key: "b", etag: "e", uploaded: UPLOADED, http: {}, custom: {} },
+					bytes: utf8("b"),
+				},
+			]);
+			const before = puts.length;
+			const ran = await cli(["restore", made.dir, "--to", "s3://live/odd"], { env: env() });
+			expect(ran.code).toBe(1);
+			expect(ran.err).toContain("which the S3 API can't carry");
+			expect(puts.length).toBe(before);
+		}
+	});
+
+	it("uses the AWS_ variables for the bucket when there are no GATEWEAVE_RESTORE_ ones", async () => {
+		const ran = await cli(["restore", repo.dir, "--to", "s3://live/aws", "--prefix", "ws-2/"], {
+			env: {
+				GATEWEAVE_BACKUP_KEY: KEY,
+				AWS_ENDPOINT_URL: endpoint,
+				AWS_ACCESS_KEY_ID: "write-key",
+				AWS_SECRET_ACCESS_KEY: "write-secret",
+			},
+		});
+		expect(ran.err).toBe("");
+		expect(live.has("aws/ws-2/f-3/empty")).toBe(true);
+	});
+
+	it("puts only a bucket's snapshot into a bucket, and says what it needs to reach one", async () => {
+		const database = await cli(["restore", repoDir, "--to", "s3://live/db"], { env: env() });
+		expect(database.code).toBe(1);
+		expect(database.err).toContain("not of a bucket");
+
+		const unreached = await cli(["restore", repo.dir, "--to", "s3://live"], {
+			env: { GATEWEAVE_BACKUP_KEY: KEY },
+		});
+		expect(unreached.code).toBe(1);
+		expect(unreached.err).toContain("--to-endpoint, GATEWEAVE_RESTORE_ENDPOINT_URL");
+
+		const as = await cli(["restore", repo.dir, "--to", "s3://live", "--as", "files"], {
+			env: env(),
+		});
+		expect(as.code).toBe(2);
+		const where = await cli(["restore", repo.dir, "--to", join(temp, "x"), "--to-region", "eu"]);
+		expect(where.code).toBe(2);
+		const prefix = await cli(["show", repo.dir, "--prefix", "ws-1/"]);
+		expect(prefix.code).toBe(2);
 	});
 });
 

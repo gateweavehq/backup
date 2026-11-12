@@ -2,7 +2,8 @@ import { createHash, createHmac } from "node:crypto";
 
 /**
  * AWS Signature Version 4, for the requests the CLI makes to an S3-compatible bucket: R2, AWS S3,
- * Backblaze B2, MinIO. Only reads are signed, so a payload is always empty.
+ * Backblaze B2, MinIO. A read's payload is empty; a restore into a bucket signs each object's
+ * SHA-256, so the bucket refuses bytes that don't match it.
  */
 
 export interface Credentials {

@@ -17,7 +17,8 @@ buckets, every night into an R2 bucket:
   table, keeping none of it;
 - a failed, late or stuck backup sends an alert by email, to a signed webhook, or both;
 - a restore CLI, one file for Node, reads the bucket with the key alone and writes SQL for a new D1
-  database, a SQLite file or a bucket's objects, never over anything.
+  database or a SQLite file, or puts a bucket's objects back with their metadata, never over
+  anything.
 
 KV sources and the copy outside Cloudflare come next. See [docs/deploy.md](docs/deploy.md), [docs/restore.md](docs/restore.md),
 [docs/architecture.md](docs/architecture.md) and [docs/format.md](docs/format.md).

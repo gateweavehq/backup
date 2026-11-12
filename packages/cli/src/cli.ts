@@ -8,11 +8,12 @@ import {
 	pickSnapshot,
 	type RestoreAs,
 	restoreSnapshot,
+	restoreToBucket,
 	type SnapshotInfo,
 	showSnapshot,
 } from "./commands";
 import { readMasterKey, UsageError } from "./key";
-import { openStore } from "./stores";
+import { openStore, openTarget } from "./stores";
 
 export const HELP = `gateweave-backup: read and restore Gateweave Backup repositories, with nothing but the key.
 
@@ -26,7 +27,7 @@ Usage:
       Read a snapshot as a restore would, and restore each database in it into memory to count
       it. --all checks every snapshot.
   gateweave-backup restore <repository> [snapshot] --to <folder> [--as sql|sqlite|files]
-                           [--object <name>]
+                           [--object <name>] [--prefix <key prefix>]
       Write a snapshot out to a folder. It writes only new files, never over anything.
       sql (the default for a database): database.sql, to load into a new D1 database with
         npx wrangler d1 execute <new database> --remote --file database.sql
@@ -34,6 +35,13 @@ Usage:
       files: the files the snapshot holds, as they were backed up.
       A snapshot of an app's Durable Objects gives <object>.sql or <object>.sqlite for each
       object, or only for the one --object names.
+      A snapshot of a bucket gives bucket.json and files/<key> for each object, or only for
+      the objects whose keys start with --prefix.
+  gateweave-backup restore <repository> [snapshot] --to s3://<bucket>[/<folder>]
+                           [--prefix <key prefix>]
+      Put a snapshot of a bucket back into a bucket, each object with its metadata, or only
+      the objects whose keys start with --prefix. An object goes in only where its key is
+      free: nothing in the bucket is ever replaced.
 
 <repository> is a folder holding a copy of one (config.json, snapshots/, data/), or
 s3://<bucket>/<folder> for one in R2 or another S3-compatible bucket, such as
@@ -49,6 +57,12 @@ An s3:// repository:
   AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN): for R2, an API token
   that can read the bucket. This tool only reads, whatever the token allows.
   --region or AWS_REGION: auto unless the provider wants one.
+
+Restoring into a bucket (--to s3://):
+  --to-endpoint <url> or GATEWEAVE_RESTORE_ENDPOINT_URL, GATEWEAVE_RESTORE_ACCESS_KEY_ID and
+  GATEWEAVE_RESTORE_SECRET_ACCESS_KEY (and GATEWEAVE_RESTORE_SESSION_TOKEN): for R2, an API
+  token that can write to that bucket. Without them, the AWS_ ones are used.
+  --to-region or GATEWEAVE_RESTORE_REGION: as --region.
 
 Other options:
   --json   Print snapshots, show and check as JSON.
@@ -100,9 +114,21 @@ export async function run(argv: string[], io: Io): Promise<number> {
 		if (command === "restore" && values.to === undefined) {
 			throw new UsageError("restore needs --to <folder>, a folder to write the snapshot to.");
 		}
+		if (values.prefix !== undefined && command !== "restore") {
+			throw new UsageError("--prefix is for restore.");
+		}
 		const as = values.as;
 		if (as !== undefined && as !== "sql" && as !== "sqlite" && as !== "files") {
 			throw new UsageError("--as is sql, sqlite or files.");
+		}
+		const intoBucket = command === "restore" && values.to?.startsWith("s3://") === true;
+		if (intoBucket && (as !== undefined || values.object !== undefined)) {
+			throw new UsageError(
+				"A bucket takes a snapshot of a bucket as it is: leave out --as and --object.",
+			);
+		}
+		if (!intoBucket && (values["to-endpoint"] !== undefined || values["to-region"] !== undefined)) {
+			throw new UsageError("--to-endpoint and --to-region are for restore --to s3://.");
 		}
 		const store = openStore(location, {
 			env: io.env,
@@ -110,6 +136,14 @@ export async function run(argv: string[], io: Io): Promise<number> {
 			...(values.region !== undefined ? { region: values.region } : {}),
 			...(io.fetch ? { fetch: io.fetch } : {}),
 		});
+		// Reached before the key is asked for, so a missing token is said first.
+		const target = intoBucket
+			? openTarget(values.to ?? "", {
+					env: io.env,
+					...(values["to-endpoint"] !== undefined ? { endpoint: values["to-endpoint"] } : {}),
+					...(values["to-region"] !== undefined ? { region: values["to-region"] } : {}),
+				})
+			: undefined;
 		const key = await readMasterKey({
 			env: io.env,
 			...(values["key-file"] !== undefined ? { keyFile: values["key-file"] } : {}),
@@ -177,10 +211,30 @@ export async function run(argv: string[], io: Io): Promise<number> {
 			}
 			case "restore": {
 				const name = await pickSnapshot(repo, snapshot);
+				if (target) {
+					const report = await restoreToBucket(repo, name, target, {
+						...(values.prefix !== undefined ? { prefix: values.prefix } : {}),
+						done: (key, placed) =>
+							io.out(placed === "created" ? `Put back ${key}\n` : `Left ${key}: there already\n`),
+					});
+					const put = report.created.length;
+					const left = report.there.length;
+					io.out(
+						`Snapshot ${name}: put back ${put} ${put === 1 ? "object" : "objects"}, ${bytes(report.bytes)}, into ${report.to}.${left > 0 ? ` ${left} ${left === 1 ? "was" : "were"} there already and left as ${left === 1 ? "it is" : "they are"}.` : ""}\n`,
+					);
+					if (report.lowered.length > 0) {
+						const names = report.lowered.map((was) => `${was} as ${was.toLowerCase()}`);
+						io.out(
+							`The S3 API keeps custom metadata names in lower case, so the bucket has ${names.join(", ")}.\n`,
+						);
+					}
+					return 0;
+				}
 				const report = await restoreSnapshot(repo, name, {
 					to: values.to ?? "",
 					...(as !== undefined ? { as: as as RestoreAs } : {}),
 					...(values.object !== undefined ? { object: values.object } : {}),
+					...(values.prefix !== undefined ? { prefix: values.prefix } : {}),
 				});
 				for (const path of report.written) io.out(`Wrote ${path}\n`);
 				const tables = report.databases.reduce((sum, d) => sum + d.summary.tables.length, 0);
@@ -225,9 +279,12 @@ function parse(argv: string[]) {
 			object: { type: "string" },
 			all: { type: "boolean" },
 			json: { type: "boolean" },
+			prefix: { type: "string" },
 			"key-file": { type: "string" },
 			endpoint: { type: "string" },
 			region: { type: "string" },
+			"to-endpoint": { type: "string" },
+			"to-region": { type: "string" },
 			help: { type: "boolean", short: "h" },
 		},
 	});

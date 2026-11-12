@@ -13,7 +13,12 @@ export default defineConfig({
 				bindings: {
 					BACKUP_KEY: TEST_KEY,
 					TEST_MIGRATIONS: await readD1Migrations(join(import.meta.dirname, "migrations")),
+					// The copy's key, which the stand-in bucket takes.
+					COPY_ACCESS_KEY_ID: "copy-key",
+					COPY_SECRET_ACCESS_KEY: "copy-secret",
 				},
+				// Every fetch the Worker makes reaches the stand-in for a bucket elsewhere.
+				outboundService: "s3",
 				// An app whose Durable Objects are a source, as Track's are.
 				workers: [
 					{
@@ -25,6 +30,12 @@ export default defineConfig({
 							DIRECTORY: { className: "Directory", useSQLite: true },
 							STORE: { className: "Store", useSQLite: true },
 						},
+					},
+					{
+						name: "s3",
+						modules: true,
+						scriptPath: join(import.meta.dirname, "test", "s3-worker.js"),
+						compatibilityDate: "2026-11-01",
 					},
 				],
 			},

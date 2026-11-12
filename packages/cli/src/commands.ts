@@ -22,10 +22,11 @@ import {
 	RepositoryError,
 	readBucketIndex,
 	restoreSql,
+	sendable,
 	splitLines,
 	summarizeDump,
 } from "@gateweave/backup-core";
-import { type Placed, PUT_LIMIT, type S3Target, sendable } from "./stores";
+import { type Placed, PUT_LIMIT, type S3Target } from "./stores";
 
 /**
  * SQLite, loaded when a command needs it. Node 22 calls `node:sqlite` experimental and says so when

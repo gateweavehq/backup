@@ -17,16 +17,19 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
+	authorization,
 	BUCKET_INDEX,
 	type BucketObject,
 	bucketFile,
 	dumpSqlite,
+	EMPTY_SHA256,
 	type FileEntry,
 	generateMasterKey,
 	joinLines,
 	type Manifest,
 	MemoryStore,
 	objectFile,
+	parseListing,
 	Repository,
 	type Row,
 	utf8,
@@ -34,8 +37,7 @@ import {
 } from "@gateweave/backup-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { HELP, type Io, run } from "../src/cli";
-import { authorization, EMPTY_SHA256 } from "../src/sigv4";
-import { FolderStore, parseListing, StoreError } from "../src/stores";
+import { FolderStore, StoreError } from "../src/stores";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PACKAGE = join(HERE, "..");
@@ -534,14 +536,14 @@ describe("an S3-compatible bucket", () => {
 		for (const folder of [ODD, "flaky"]) {
 			for (const [key, value] of store.objects) objects.set(`${folder}/${key}`, value);
 		}
-		server = createServer((request, response) => {
+		server = createServer(async (request, response) => {
 			methods.add(request.method ?? "");
 			authorizations.push(request.headers.authorization ?? "");
 			// Signed again here from what arrived, so a path or query sent unlike it was signed fails,
 			// as R2 would refuse it.
 			const [rawPath = "/", rawQuery = ""] = (request.url ?? "/").split("?");
 			const amzDate = String(request.headers["x-amz-date"] ?? "");
-			const expected = authorization(
+			const expected = await authorization(
 				{
 					method: request.method ?? "",
 					path: rawPath,
@@ -784,7 +786,7 @@ describe("restoring a snapshot of a bucket", () => {
 					!signed.includes(name.toLowerCase()),
 			);
 			if (!auth || !secret || unsigned) return answer(403, "AccessDenied");
-			const expected = authorization(
+			const expected = await authorization(
 				{
 					method: request.method ?? "",
 					path: rawPath,

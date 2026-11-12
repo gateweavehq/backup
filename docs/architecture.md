@@ -69,7 +69,8 @@ the same account.
 
 [deploy.md](deploy.md) says how to set it up. Today it backs up D1, an app's Durable Objects
 through its `Backup` entrypoint, and R2 buckets, into one R2 bucket, with the catalog, the lock and
-retention; the rest of this section is still to come where it says so.
+retention, and copies them to a bucket at another provider when one is set; the rest of this
+section is still to come where it says so.
 
 - **Runs in the owner's own Cloudflare account,** through the Deploy button, so the data and the
   key never pass through Gateweave. A hosted version would hold a token for every customer's
@@ -96,7 +97,7 @@ retention; the rest of this section is still to come where it says so.
   every object with its metadata. One deleted after it was listed is left out. A newest snapshot
   that doesn't open is no help, so then every object is read again.
 - **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
-  prune, test when due, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
+  prune, test when due, copy when set, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
   `wrangler workflows trigger` starts one by hand.
 - **A D1 catalog** of runs, snapshots, locks and restore tests feeds the page, the alerts and
@@ -125,7 +126,20 @@ retention; the rest of this section is still to come where it says so.
   the same transaction crashed workerd when we tried it. `JURISDICTION` keeps the objects where the
   bucket is. An object runs one test at a time, since a step that timed out may be tried again
   while its first try is still running.
-- **Alerts.** A run in which a backup or a restore test failed ends with an alert, and so does
+- **The copy outside Cloudflare** (principle 3) goes to any S3-compatible bucket that `COPY_TO`
+  names, through core's own SigV4 client, since a Worker has no SDK to spare. After the restore test
+  and under the lock, so the vault holds still, a step lists the copy, works out the objects the
+  vault's snapshots need (`Repository.neededKeys()`), and sends what is missing, 200 objects or
+  256 MB at a time: chunks, then `config.json`, then the manifests, so a copy cut short holds no
+  manifest without its chunks. The objects go as they are, still sealed, so the copy needs no key
+  of its own and opens with the master key alone. Then the copy is pruned by the same retention,
+  on its own snapshots: one the vault lost stays until the policy lets it go, which is what the
+  copy is for, and a lock there holds what it would delete, counted as held. A copy whose
+  `config.json` isn't the vault's holds another repository, whose snapshots the new manifests
+  wouldn't open with; it is left alone rather than pruned for them. A refusal (4xx) or a missing
+  object fails the copy at once; a busy bucket is tried again. A failed copy fails the run and keeps
+  the backup, like a failed restore test, and the `copy` table says why.
+- **Alerts.** A run in which a backup, a restore test or a copy failed ends with an alert, and so does
   one that asks for it (`"alert": true`). The Worker's own cron checks each morning, six hours after
   the nightly run, that every source's newest backup started in the last 26 hours and hasn't been
   going for over 5, and alerts if not: that catches the runs that never got far enough to send their

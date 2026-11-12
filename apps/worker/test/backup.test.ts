@@ -11,6 +11,7 @@ import {
 	fromUtf8,
 	generateMasterKey,
 	joinLines,
+	type ObjectStore,
 	Repository,
 	readBucketIndex,
 	restoreSql,
@@ -36,6 +37,7 @@ import {
 	objectReader,
 	R2Store,
 } from "../src/bindings";
+import { CopyConfigError, copyNew, copyTarget } from "../src/copy";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
 
@@ -68,7 +70,9 @@ beforeEach(async () => {
 		env.CATALOG.prepare("DELETE FROM lock"),
 		env.CATALOG.prepare("DELETE FROM restore_test"),
 		env.CATALOG.prepare("DELETE FROM alert"),
+		env.CATALOG.prepare("DELETE FROM copy"),
 	]);
+	await offsite("/__reset", "");
 	for (const bucket of [env.VAULT, env.FILES]) {
 		let listed = await bucket.list();
 		while (listed.objects.length > 0) {
@@ -84,6 +88,33 @@ beforeEach(async () => {
 		...PEOPLE.map((sql) => env.SOURCE_DB.prepare(sql)),
 	]);
 });
+
+/**
+ * Drives the stand-in for the bucket at another provider (test/s3-worker.js), which every fetch
+ * reaches: a GET says what it holds and how many PUTs it took, a POST changes how it answers.
+ */
+async function offsite(path: string, body?: string): Promise<{ keys: string[]; puts: number }> {
+	if (body === undefined) return (await fetch(`https://copy.test${path}`)).json();
+	await fetch(`https://copy.test${path}`, { method: "POST", body });
+	return { keys: [], puts: 0 };
+}
+
+/** A source's repository in the copy outside Cloudflare, as the Worker reaches it. */
+function copyOf(source = "app"): ObjectStore {
+	const target = copyTarget(env);
+	if (!target) throw new Error("COPY_TO names no bucket.");
+	return target.storeFor(source);
+}
+
+async function keysOf(store: ObjectStore): Promise<string[]> {
+	const keys: string[] = [];
+	for await (const key of store.list("")) keys.push(key);
+	return keys.sort();
+}
+
+async function copies() {
+	return (await env.CATALOG.prepare("SELECT * FROM copy ORDER BY copied_at, run").all()).results;
+}
 
 type Instance = Awaited<ReturnType<typeof introspectWorkflowInstance>>;
 type Modifier = Parameters<Parameters<Instance["modify"]>[0]>[0];
@@ -150,6 +181,7 @@ describe("a backup run", () => {
 					status: "ok",
 					snapshot: expect.stringMatching(/^\d{8}T/),
 					test: "passed",
+					copy: "ok",
 				},
 			],
 		});
@@ -283,16 +315,22 @@ describe("a backup run", () => {
 			expect.stringMatching(/^Backup run · \d{1,2} [A-Z][a-z]{2} \d{4}, \d\d:\d\d UTC$/),
 			"",
 			"app       Backed up",
-			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			expect.stringMatching(
+				/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test, and copied outside Cloudflare\.$/,
+			),
 			"broken    Failed",
 			"          The backup failed. The snapshots made before it stay.",
 			"          Source broken's binding VAULT isn't a D1 database.",
 			"objects   Backed up",
-			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			expect.stringMatching(
+				/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test, and copied outside Cloudflare\.$/,
+			),
 			"files     Backed up",
-			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			expect.stringMatching(
+				/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test, and copied outside Cloudflare\.$/,
+			),
 			"",
-			"The catalog's run and restore_test tables have the details, under this run's id:",
+			"The catalog's run, restore_test and copy tables have the details, under this run's id:",
 			"  all",
 			"",
 			"--",
@@ -410,6 +448,7 @@ describe("an app's Durable Objects", () => {
 					status: "ok",
 					snapshot: expect.stringMatching(/^\d{8}T/),
 					test: "passed",
+					copy: "ok",
 				},
 			],
 		});
@@ -561,6 +600,7 @@ describe("an R2 bucket", () => {
 					status: "ok",
 					snapshot: expect.stringMatching(/^\d{8}T/),
 					test: "passed",
+					copy: "ok",
 				},
 			],
 		});
@@ -989,6 +1029,202 @@ describe("restore tests", () => {
 		expect(testInterval("7")).toBe(7);
 		for (const bad of ["0", "1.5", "a week", "400"]) {
 			expect(() => testInterval(bad), bad).toThrow("RESTORE_TEST_DAYS must be");
+		}
+	});
+});
+
+describe("the copy outside Cloudflare", () => {
+	it("holds what the vault's snapshots need, as sealed, and a later run sends only what is new", async () => {
+		await backUp("one", { sources: ["app"] });
+		const vault = new R2Store(env.VAULT, "app/");
+		const keys = await keysOf(copyOf());
+		expect(keys).toEqual(await keysOf(vault));
+		let size = 0;
+		for (const key of keys) {
+			const sealed = await vault.get(key);
+			expect(await copyOf().get(key), key).toEqual(sealed);
+			size += sealed?.length ?? 0;
+		}
+		// The backup key opens it on its own, and its snapshot restores to the same rows.
+		const copy = await Repository.open(copyOf(), env.BACKUP_KEY);
+		const [name] = await copy.snapshots();
+		expect([name]).toEqual(await (await repository()).snapshots());
+		await restore(copy, name ?? "");
+		const original = await env.SOURCE_DB.prepare(PEOPLE_QUERY).all();
+		expect((await env.RESTORE_DB.prepare(PEOPLE_QUERY).all()).results).toEqual(original.results);
+		expect(await copies()).toEqual([
+			{
+				run: "one/app",
+				source: "app",
+				copied_at: expect.any(Number),
+				status: "ok",
+				object_count: keys.length,
+				size,
+				snapshot_count: 1,
+				forgotten: 0,
+				held_snapshots: 0,
+				deleted_chunks: 0,
+				held_chunks: 0,
+				error: null,
+			},
+		]);
+
+		await env.SOURCE_DB.prepare("UPDATE person SET note = 'changed' WHERE id = 2").run();
+		await backUp("two", { sources: ["app"] });
+		// The new chunk and manifest went, and the copy let the day's older snapshot go, as the vault did.
+		expect(await keysOf(copyOf())).toEqual(await keysOf(vault));
+		const [, second] = await copies();
+		expect(second).toMatchObject({
+			run: "two/app",
+			status: "ok",
+			object_count: 2,
+			snapshot_count: 1,
+			forgotten: 1,
+			deleted_chunks: 1,
+		});
+		expect((await offsite("/__objects")).puts).toBe(keys.length + 2);
+	});
+
+	it("keeps a snapshot the vault lost, until its own retention lets it go", async () => {
+		// A snapshot from two days ago, which the policy keeps.
+		const made = await Repository.init(new R2Store(env.VAULT, "app/"), env.BACKUP_KEY);
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const { entry } = await made.writeFile("database.jsonl", utf8(joinLines(lines)));
+		const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+		const old = (await made.commit({ kind: "d1", name: "app" }, [entry], {}, twoDaysAgo)).name;
+		await backUp("one", { sources: ["app"] });
+
+		// The vault loses it.
+		await (await repository()).forget(old);
+		await env.SOURCE_DB.prepare("UPDATE person SET note = 'changed' WHERE id = 2").run();
+		await backUp("two", { sources: ["app"] });
+
+		const kept = await (await repository()).snapshots();
+		expect(kept).toHaveLength(1);
+		const copy = await Repository.open(copyOf(), env.BACKUP_KEY);
+		expect(await copy.snapshots()).toEqual([old, ...kept]);
+		await restore(copy, old);
+		const note = await env.RESTORE_DB.prepare("SELECT note FROM person WHERE id = 2").first("note");
+		expect(note).toBe("Grüße, 🙂");
+	});
+
+	it("fails and is alerted when the bucket refuses it, and the backup stays in the vault", async () => {
+		await offsite("/__fail", "1");
+		const result = await backUp("refused", { sources: ["app"] });
+		expect(result.ended).toBe("errored");
+		expect(result.error?.message).toContain("The copy of app outside Cloudflare failed.");
+		expect(await runs()).toEqual([expect.objectContaining({ source: "app", status: "ok" })]);
+		expect(await (await repository()).snapshots()).toHaveLength(1);
+		expect(await copies()).toEqual([
+			expect.objectContaining({
+				run: "refused/app",
+				status: "failed",
+				object_count: 0,
+				snapshot_count: null,
+				error: expect.stringContaining("403 (AccessDenied)"),
+			}),
+		]);
+		const [alert] = await alerts();
+		expect(alert?.subject).toBe("Gateweave Backup: the copy of app outside Cloudflare failed");
+		const text = String(alert?.text).split("\n");
+		expect(text.slice(3, 6)).toEqual([
+			"app   Copy failed",
+			expect.stringMatching(
+				/^ {6}Snapshot \d{8}T\S+ was made, restored and counted by a restore test, but copying it outside Cloudflare failed\. It is in the vault\.$/,
+			),
+			expect.stringContaining("403 (AccessDenied)"),
+		]);
+
+		// The next run sends what this one didn't.
+		await backUp("again", { sources: ["app"] });
+		expect(await keysOf(copyOf())).toEqual(await keysOf(new R2Store(env.VAULT, "app/")));
+	});
+
+	it("counts what a lock on its bucket keeps, and leaves it for a later run", async () => {
+		await backUp("one", { sources: ["app"] });
+		await offsite("/__lock", JSON.stringify((await offsite("/__objects")).keys));
+		await env.SOURCE_DB.prepare("UPDATE person SET note = 'changed' WHERE id = 2").run();
+		const result = await backUp("two", { sources: ["app"] });
+		expect(result.ended).toBe("complete");
+		const [, second] = await copies();
+		expect(second).toMatchObject({
+			status: "ok",
+			snapshot_count: 2,
+			forgotten: 0,
+			held_snapshots: 1,
+			deleted_chunks: 0,
+			held_chunks: 0,
+		});
+		expect(await (await Repository.open(copyOf(), env.BACKUP_KEY)).snapshots()).toHaveLength(2);
+	});
+
+	it("leaves a copy of another repository as it is", async () => {
+		await backUp("one", { sources: ["app"] });
+		const before = await keysOf(copyOf());
+		// The vault's repository is lost, and the next run makes a new one.
+		const lost = await env.VAULT.list({ prefix: "app/" });
+		await env.VAULT.delete(lost.objects.map((o) => o.key));
+		const result = await backUp("two", { sources: ["app"] });
+		expect(result.ended).toBe("errored");
+		expect(await (await repository()).snapshots()).toHaveLength(1);
+		const [, second] = await copies();
+		expect(second).toMatchObject({
+			status: "failed",
+			object_count: 0,
+			error: expect.stringContaining("The copy holds another repository than the vault"),
+		});
+		expect(await keysOf(copyOf())).toEqual(before);
+	});
+
+	it("goes in steps, chunks first and manifests last", async () => {
+		const vault = new R2Store(env.VAULT, "app/");
+		const repo = await Repository.init(vault, env.BACKUP_KEY, {
+			chunker: { min: 128, avg: 512, max: 2048 },
+		});
+		// Rows that differ, so no two chunks are the same.
+		const rows = Array.from({ length: 600 }, (_, n) => `row ${n}: ${(n * 7919) % 104729} ünïcode`);
+		const { entry } = await repo.writeFile("database.jsonl", utf8(rows.join("\n")));
+		await repo.commit({ kind: "d1", name: "app" }, [entry], {});
+		const needed = await repo.neededKeys();
+		expect(needed.length).toBeGreaterThan(6);
+
+		const steps: { copied: number; done: boolean; keys: string[] }[] = [];
+		for (let done = false; !done; ) {
+			const progress = await copyNew(repo, vault, copyOf(), { objects: 3, bytes: Infinity });
+			done = progress.done;
+			steps.push({ copied: progress.copied, done, keys: await keysOf(copyOf()) });
+		}
+		expect(steps.at(-1)?.keys).toEqual([...needed].sort());
+		expect(steps.slice(0, -1).every((step) => step.copied === 3 && !step.done)).toBe(true);
+		// Until the last chunk is there, the copy holds no manifest.
+		for (const step of steps) {
+			const chunks = step.keys.filter((key) => key.startsWith("data/")).length;
+			const manifests = step.keys.filter((key) => key.startsWith("snapshots/")).length;
+			if (manifests > 0) expect(chunks).toBe(new Set(entry.chunks).size);
+		}
+		expect(await copyNew(repo, vault, copyOf())).toEqual({ copied: 0, bytes: 0, done: true });
+	});
+
+	it("is set by COPY_TO, with an https endpoint and a key", () => {
+		const keys = { COPY_ACCESS_KEY_ID: "id", COPY_SECRET_ACCESS_KEY: "secret" };
+		const at = { COPY_ENDPOINT: "https://s3.example", ...keys };
+		expect(copyTarget({})).toBeUndefined();
+		expect(copyTarget({ COPY_TO: " ", ...at })).toBeUndefined();
+		expect(copyTarget({ COPY_TO: "s3://bucket/backups", ...at })?.location).toBe(
+			"s3://bucket/backups",
+		);
+		const wrong: [Record<string, string>, string][] = [
+			[{ COPY_TO: "bucket", ...at }, "COPY_TO: bucket isn't an s3:// location."],
+			[{ COPY_TO: "s3://bucket", ...keys }, "COPY_TO needs COPY_ENDPOINT"],
+			[{ COPY_TO: "s3://bucket", ...at, COPY_ENDPOINT: "http://s3.example" }, "https URL"],
+			[
+				{ COPY_TO: "s3://bucket", COPY_ENDPOINT: "https://s3.example" },
+				"COPY_TO needs the secrets",
+			],
+		];
+		for (const [setting, message] of wrong) {
+			expect(() => copyTarget(setting), message).toThrow(CopyConfigError);
+			expect(() => copyTarget(setting), message).toThrow(message);
 		}
 	});
 });

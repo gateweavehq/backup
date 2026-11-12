@@ -11,8 +11,15 @@ interface AlertEnv {
 	EMAIL?: SendEmail;
 }
 
-interface Env extends AlertEnv {}
+/** The copy outside Cloudflare's keys, secrets that only a deployment with a copy sets. */
+interface CopySecrets {
+	/** A key that may read, write and delete in COPY_TO's bucket. */
+	COPY_ACCESS_KEY_ID?: string;
+	COPY_SECRET_ACCESS_KEY?: string;
+}
+
+interface Env extends AlertEnv, CopySecrets {}
 
 declare namespace Cloudflare {
-	interface Env extends AlertEnv {}
+	interface Env extends AlertEnv, CopySecrets {}
 }

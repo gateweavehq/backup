@@ -5,7 +5,8 @@ A restore needs three things: the master key, the repository's objects, and the 
 copy of the objects elsewhere.
 
 A restore never goes over live data. The CLI writes only new files, into a folder you name, and you
-load them into a **new** database. It only reads the repository, whatever its credentials allow.
+load them into a **new** database. A bucket's objects can go straight back into a bucket, but only
+where their keys are free. It only reads the repository, whatever its credentials allow.
 
 ## Get the CLI
 
@@ -109,23 +110,51 @@ to look at it. Putting it back into the live app's object is the app's to offer;
 ## Restore an R2 bucket's objects
 
 A snapshot of a bucket, such as Track's files, holds every object's bytes and `bucket.json`, which
-lists them with their metadata ([format.md](format.md#manifests)). `restore` writes them to a
-folder: `bucket.json`, and each object at `files/<key>`.
+lists them with their metadata ([format.md](format.md#manifests)).
+
+**Into the bucket.** `--to s3://<bucket>` puts the objects back, each under its key with its type,
+its other HTTP metadata and its custom metadata. An object goes in only where its key is free: every
+upload carries `If-None-Match: *`, so the bucket refuses one whose key is taken, and nothing in it is
+ever replaced. That makes it safe to aim at the live bucket, which gets back what is missing and
+keeps the rest as it is.
+
+Pick what comes back with `--prefix`. Track keeps a workspace's files under `<workspace id>/`, so
+this brings back one workspace's files and leaves alone the ones people deleted elsewhere:
+
+```sh
+export GATEWEAVE_RESTORE_ENDPOINT_URL=https://<account id>.r2.cloudflarestorage.com
+export GATEWEAVE_RESTORE_ACCESS_KEY_ID=…
+export GATEWEAVE_RESTORE_SECRET_ACCESS_KEY=…
+node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest \
+  --to s3://gateweave-track-files --prefix "<workspace id>/"
+```
+
+The bucket takes a second R2 API token, one with **Object Read & Write** for that bucket alone, in
+the `GATEWEAVE_RESTORE_*` variables, so the token that reads the backup can stay read-only. Without
+them the `AWS_*` ones are used, which suits a restore from a copy on disk. `--to-endpoint` and
+`--to-region` stand in for the endpoint and region. Track's files bucket isn't in a jurisdiction,
+so its endpoint has no `.eu`.
+
+The CLI says each key it puts back and each it leaves, then counts them. Each object is read and
+checked as it is sent, and the upload is signed with the object's SHA-256, so the bucket refuses
+bytes that don't match it. When a restore stops half way, say on a damaged chunk, the objects put
+back so far stay, each one whole, and the same restore run again puts back the rest.
+
+The S3 API keeps custom metadata names in lower case, R2 included: Track's `uploadedBy` comes back
+as `uploadedby`, and the CLI says so. Track reads that name only to tell a retried upload from
+someone else's, so restored files work as before. Metadata no header can carry, such as a name
+outside ASCII, stops the restore before anything is sent; an object over 4.995 GiB, more than one
+upload takes at R2, does too.
+
+**Into a folder.** `--to <folder>` writes `bucket.json`, and each object at `files/<key>`.
+`--prefix` works here too.
 
 ```sh
 node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest --to ./restore
 ```
 
 A key that can't be a path in a folder, such as one with `..` or `//` in it, stops the restore and
-says so. To put an object back, upload its file under its key with the type `bucket.json` gives it:
-
-```sh
-npx wrangler r2 object put gateweave-track-files/<key> --remote \
-  --file "./restore/files/<key>" --content-type "<contentType>"
-```
-
-Wrangler can't set custom metadata, such as Track's `uploadedBy`. A restore straight into a
-bucket, with all of its metadata, comes next in the CLI.
+says so.
 
 ## When it fails
 

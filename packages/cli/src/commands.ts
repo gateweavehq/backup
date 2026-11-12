@@ -4,6 +4,10 @@ import { copyFile, type FileHandle, link, mkdir, open, stat, unlink } from "node
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
+	BUCKET_INDEX,
+	type BucketHttpMetadata,
+	type BucketObject,
+	bucketFile,
 	DUMP_FILE,
 	DumpError,
 	type DumpSummary,
@@ -16,10 +20,12 @@ import {
 	objectOf,
 	type Repository,
 	RepositoryError,
+	readBucketIndex,
 	restoreSql,
 	splitLines,
 	summarizeDump,
 } from "@gateweave/backup-core";
+import { type Placed, PUT_LIMIT, type S3Target, sendable } from "./stores";
 
 /**
  * SQLite, loaded when a command needs it. Node 22 calls `node:sqlite` experimental and says so when
@@ -306,7 +312,7 @@ export interface RestoreReport {
 export async function restoreSnapshot(
 	repo: Repository,
 	name: string,
-	{ to, as, object }: { to: string; as?: RestoreAs; object?: string },
+	{ to, as, object, prefix }: { to: string; as?: RestoreAs; object?: string; prefix?: string },
 ): Promise<RestoreReport> {
 	const manifest = await repo.manifest(name);
 	const dumps = dumpsOf(manifest, object);
@@ -316,7 +322,14 @@ export async function restoreSnapshot(
 		throw new RestoreError(`Snapshot ${name} holds no database; restore it --as files.`);
 	}
 	const folder = resolve(to);
-	const files = object === undefined ? manifest.files : dumps.map((dump) => dump.entry);
+	let files = object === undefined ? manifest.files : dumps.map((dump) => dump.entry);
+	if (prefix !== undefined) {
+		// bucket.json goes too, as it lists every object with what R2 kept beside its bytes.
+		const chosen = new Set(
+			(await bucketObjects(repo, manifest, prefix)).map((item) => bucketFile(item.key)),
+		);
+		files = files.filter((entry) => entry.path === BUCKET_INDEX || chosen.has(entry.path));
+	}
 	const targets =
 		way === "files"
 			? files.map((file) => join(folder, ...safePath(file.path).split("/")))
@@ -353,6 +366,178 @@ export async function restoreSnapshot(
 		for (const path of written) await unlink(path).catch(() => {});
 		throw error;
 	}
+}
+
+/** The objects a snapshot of a bucket lists in bucket.json, or those whose keys start with `prefix`. */
+async function bucketObjects(
+	repo: Repository,
+	manifest: Manifest,
+	prefix?: string,
+): Promise<BucketObject[]> {
+	const { kind, name } = manifest.source;
+	if (kind !== "r2") {
+		throw new RestoreError(
+			`Snapshot ${manifest.name} is of ${kind} ${name}, not of a bucket: only a bucket's objects are picked with --prefix, or go back into a bucket.`,
+		);
+	}
+	const index = manifest.files.find((entry) => entry.path === BUCKET_INDEX);
+	if (!index) throw new RestoreError(`Snapshot ${manifest.name} has no ${BUCKET_INDEX}.`);
+	const objects = readBucketIndex(await repo.readWholeFile(index));
+	if (prefix === undefined) return objects;
+	const chosen = objects.filter((item) => item.key.startsWith(prefix));
+	if (chosen.length === 0) {
+		throw new RestoreError(
+			`Snapshot ${manifest.name} holds no object whose key starts with ${JSON.stringify(prefix)}.`,
+		);
+	}
+	return chosen;
+}
+
+/** How bucket.json's HTTP metadata goes back into a PutObject's headers. */
+const HTTP_HEADERS: Record<keyof BucketHttpMetadata, string> = {
+	contentType: "Content-Type",
+	contentLanguage: "Content-Language",
+	contentDisposition: "Content-Disposition",
+	contentEncoding: "Content-Encoding",
+	cacheControl: "Cache-Control",
+	cacheExpiry: "Expires",
+};
+
+/** A name HTTP takes for a header: RFC 9110's token. */
+const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * The headers that give an object back its metadata. Custom metadata goes in `x-amz-meta-*`, and
+ * a value that a header wouldn't carry as it is goes RFC 2047-encoded, which R2 decodes before it
+ * stores the value. Metadata no header can carry stops the restore, naming the object.
+ */
+export function headersOf(object: BucketObject): [string, string][] {
+	const cannot = (what: string) =>
+		new RestoreError(
+			`${JSON.stringify(object.key)} has ${what}, which the S3 API can't carry. Restore it to a folder instead.`,
+		);
+	const headers: [string, string][] = [];
+	for (const [field, header] of Object.entries(HTTP_HEADERS)) {
+		const value = object.http[field as keyof BucketHttpMetadata];
+		if (value === undefined) continue;
+		if (field === "cacheExpiry") {
+			const at = new Date(value);
+			if (Number.isNaN(at.getTime())) throw cannot("an expiry that isn't a time");
+			headers.push([header, at.toUTCString()]);
+			continue;
+		}
+		if (!plain(value)) throw cannot(`a ${header} that isn't plain ASCII`);
+		headers.push([header, value]);
+	}
+	const names = new Set<string>();
+	for (const [name, value] of Object.entries(object.custom)) {
+		if (!TOKEN.test(name)) throw cannot("a custom metadata name that can't be a header's");
+		// Header names have no case, so these two would arrive as one.
+		if (names.has(name.toLowerCase())) {
+			throw cannot("custom metadata names that differ only in case");
+		}
+		names.add(name.toLowerCase());
+		const sent = plain(value) && !value.includes("=?") ? value : encodedWord(value);
+		headers.push([`x-amz-meta-${name}`, sent]);
+	}
+	return headers;
+}
+
+/** Printable ASCII with no space at either end: a header value that arrives as it was sent. */
+function plain(value: string): boolean {
+	return value === "" || /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value);
+}
+
+/** An RFC 2047 encoded word: UTF-8, in base64. */
+function encodedWord(value: string): string {
+	return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+export interface BucketRestoreReport {
+	name: string;
+	/** Where the objects went, as `s3://<bucket>[/<folder>]`. */
+	to: string;
+	/** The keys put back. */
+	created: string[];
+	/** The keys that were taken, whose objects were left as they are. */
+	there: string[];
+	/** The bytes put back. */
+	bytes: number;
+	/**
+	 * Custom metadata names with capitals, among the objects put back. The S3 API keeps names in
+	 * lower case, R2's as well, so `uploadedBy` comes back as `uploadedby`.
+	 */
+	lowered: string[];
+}
+
+/**
+ * Puts a snapshot of a bucket back into a bucket: every object, or those whose keys start with
+ * `prefix`, each with its metadata. Everything is checked before anything is sent, and an object
+ * goes in only where its key is free, so nothing there is replaced. Stopped half way, it leaves
+ * the objects it put, each one whole, and the same restore again puts back the rest.
+ */
+export async function restoreToBucket(
+	repo: Repository,
+	name: string,
+	target: S3Target,
+	{ prefix, done }: { prefix?: string; done?: (key: string, placed: Placed) => void } = {},
+): Promise<BucketRestoreReport> {
+	const manifest = await repo.manifest(name);
+	const files = new Map(manifest.files.map((entry) => [entry.path, entry] as const));
+	const plans = (await bucketObjects(repo, manifest, prefix)).map((object) => {
+		const key = JSON.stringify(object.key);
+		const entry = files.get(bucketFile(object.key));
+		if (!entry || entry.size !== object.size) {
+			throw new RestoreError(`Snapshot ${name} doesn't hold ${key} as bucket.json lists it.`);
+		}
+		if (entry.size > PUT_LIMIT) {
+			throw new RestoreError(
+				`${key} is larger than one PutObject takes at R2, 5 MiB less than 5 GiB. Restore it to a folder and upload it with rclone or aws s3 cp.`,
+			);
+		}
+		if (!sendable(object.key)) {
+			throw new RestoreError(
+				`${key} has an empty, . or .. part, which a request's path would lose, so it can't go back under its key.`,
+			);
+		}
+		return { object, entry, headers: headersOf(object) };
+	});
+	const report: BucketRestoreReport = {
+		name,
+		to: target.location,
+		created: [],
+		there: [],
+		bytes: 0,
+		lowered: [],
+	};
+	const lowered = new Set<string>();
+	try {
+		for (const { object, entry, headers } of plans) {
+			const placed = await target.create({
+				key: object.key,
+				size: entry.size,
+				sha256: entry.sha256,
+				headers,
+				body: () => verified(repo, entry),
+			});
+			if (placed === "created") {
+				report.created.push(object.key);
+				report.bytes += entry.size;
+				for (const name of Object.keys(object.custom)) {
+					if (name !== name.toLowerCase()) lowered.add(name);
+				}
+			} else report.there.push(object.key);
+			done?.(object.key, placed);
+		}
+	} catch (error) {
+		const put = report.created.length;
+		if (put === 0) throw error;
+		throw new RestoreError(
+			`${messageOf(error)} ${put} ${put === 1 ? "object was" : "objects were"} put back before that; the same restore again puts back the rest.`,
+		);
+	}
+	report.lowered = [...lowered].sort();
+	return report;
 }
 
 /** Writes one dump as SQL, or loads it into a new SQLite file. */

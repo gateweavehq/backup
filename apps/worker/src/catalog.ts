@@ -3,6 +3,7 @@
  * Workflow step that wrote and then failed runs again.
  */
 
+import type { Alert } from "./alerts";
 import type { RestoreTestResult } from "./restore-test";
 
 /** Long enough for any run; a run that died holding the lock frees it when this runs out. */
@@ -171,4 +172,69 @@ export async function recordTest(
 			test.error?.slice(0, ERROR_LENGTH) ?? null,
 		)
 		.run();
+}
+
+/** Keeps an alert, once: a second one under the same key is the first sent again. */
+export async function recordAlert(db: D1Database, alert: Alert, at: number): Promise<void> {
+	await db
+		.prepare(
+			"INSERT INTO alert (key, made_at, subject, text) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (key) DO NOTHING",
+		)
+		.bind(alert.key, at, alert.subject, alert.text)
+		.run();
+}
+
+export async function alertSent(db: D1Database, key: string): Promise<boolean> {
+	const at = await db
+		.prepare("SELECT sent_at FROM alert WHERE key = ?1")
+		.bind(key)
+		.first<number | null>("sent_at");
+	return at !== null;
+}
+
+/** Notes where an alert went: `went` is empty when no destination is set up. */
+export async function markAlertSent(
+	db: D1Database,
+	key: string,
+	went: string[],
+	at: number,
+): Promise<void> {
+	await db
+		.prepare("UPDATE alert SET sent_to = ?2, sent_at = ?3, error = NULL WHERE key = ?1")
+		.bind(key, went.join(","), at)
+		.run();
+}
+
+export async function markAlertFailed(db: D1Database, key: string, error: string): Promise<void> {
+	await db
+		.prepare("UPDATE alert SET error = ?2 WHERE key = ?1 AND sent_at IS NULL")
+		.bind(key, error.slice(0, ERROR_LENGTH))
+		.run();
+}
+
+/** The alerts made since `since` that haven't gone, oldest first. */
+export async function unsentAlerts(db: D1Database, since: number): Promise<Alert[]> {
+	const { results } = await db
+		.prepare(
+			"SELECT key, subject, text FROM alert WHERE sent_at IS NULL AND made_at >= ?1 ORDER BY made_at, key",
+		)
+		.bind(since)
+		.all<Alert>();
+	return results;
+}
+
+/** When the source's newest run started, or null if none has. */
+export async function lastStart(db: D1Database, source: string): Promise<number | null> {
+	return db
+		.prepare("SELECT max(started_at) AS at FROM run WHERE source = ?1")
+		.bind(source)
+		.first<number | null>("at");
+}
+
+/** When the source's oldest run that is still going started, or null if none is. */
+export async function oldestRunning(db: D1Database, source: string): Promise<number | null> {
+	return db
+		.prepare("SELECT min(started_at) AS at FROM run WHERE source = ?1 AND status = 'running'")
+		.bind(source)
+		.first<number | null>("at");
 }

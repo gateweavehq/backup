@@ -46,6 +46,11 @@
 			"concurrency": { "limit": 1 }
 		}
 	],
+	// The daily check, six hours after the nightly run: it alerts when a source's backup is late
+	// or stuck, and sends again an alert that didn't go. It counts on backups running every night.
+	"triggers": { "crons": ["17 9 * * *"] },
+	// Email alerts need Email Service and a domain set up to send from (docs/deploy.md), then:
+	// "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["backup@example.com"] }],
 	"vars": {
 		// What to back up. Each D1 source needs a binding of its own in `d1_databases`, and a name
 		// that never changes: it is the repository's folder in the bucket. For example:
@@ -58,7 +63,11 @@
 		"RESTORE_TEST_DAYS": "30",
 		// Where restore tests run: "eu" or "fedramp" to keep them in the bucket's jurisdiction, or
 		// empty for anywhere.
-		"JURISDICTION": ""
+		"JURISDICTION": "",
+		// Who email alerts come from, as "Name <address>" or an address, on a domain Email Service
+		// sends from. Where they go is the secret ALERT_TO. Empty sends none: see docs/deploy.md,
+		// which also has alerts by webhook.
+		"ALERT_FROM": ""
 	},
 	"secrets": {
 		// The master key, from `pnpm keygen`. Keep a copy somewhere safe: without it, no backup
@@ -110,6 +119,9 @@
 					"concurrency": { "limit": 1 }
 				}
 			],
+			"triggers": { "crons": ["17 9 * * *"] },
+			// Alerts go to the owner, whose address is the secret ALERT_TO.
+			"send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["backup@gateweave.com"] }],
 			"vars": {
 				"SOURCES": [
 					{ "name": "id", "kind": "d1", "binding": "ID_DB" },
@@ -118,7 +130,8 @@
 				],
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",
-				"JURISDICTION": "eu"
+				"JURISDICTION": "eu",
+				"ALERT_FROM": "Gateweave Backup <backup@gateweave.com>"
 			},
 			"secrets": { "required": ["BACKUP_KEY"] }
 		}

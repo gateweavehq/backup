@@ -14,7 +14,7 @@ touching anything that reads or writes a repository.
 | Path            | What lives there                                                        |
 | --------------- | ----------------------------------------------------------------------- |
 | `packages/core` | The repository format: keys, sealing, chunking, SQLite dumps, retention |
-| `apps/worker`   | The Worker: the backup Workflow, restore tests, bindings, the catalog   |
+| `apps/worker`   | The Worker: the backup Workflow, restore tests, alerts, the catalog     |
 | `packages/cli`  | The restore CLI: reads a repository with the key, writes files back     |
 | `docs/`         | Architecture, the format, deploying and restoring                       |
 | `scripts/`      | `keygen`                                                                |
@@ -67,6 +67,8 @@ Requirements: Node.js 24 (see `.node-version`; 22.13+ works) and pnpm 12.
   Object. workerd has no jurisdictions, so the tests leave `JURISDICTION` empty. Their key is public
   and only theirs.
 - A Workflow step's error comes back with its class name in front; the catalog stores it without.
+- Alert tests send to stand-ins: an `EMAIL` binding and a `fetch` of the test's own, never Email
+  Service or the network.
 
 ## Git
 

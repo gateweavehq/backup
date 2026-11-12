@@ -94,6 +94,47 @@ npx wrangler d1 execute gateweave-backup --remote \
 
 A failed test fails the run, but the backup it tested stays.
 
+## Alerts
+
+A run in which a backup or a restore test failed sends an alert, and so does the daily check
+(`triggers` in `wrangler.jsonc`, at 09:17 UTC) when a source's backup didn't start in the last 26
+hours or hasn't ended after 5. The check counts on backups running every night. Every alert is kept
+in the catalog's `alert` table, sent or not; set up where they go, by email, by webhook or both.
+
+**Email** needs [Email Service](https://developers.cloudflare.com/email-service/) sending from a
+domain of yours (`npx wrangler email sending enable example.com`). Add the binding and the sender
+to `wrangler.jsonc`:
+
+```jsonc
+"send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["backup@example.com"] }],
+"vars": { "ALERT_FROM": "Backups <backup@example.com>" }
+```
+
+and give where alerts go as a secret, so no address is in the repository: one or several,
+separated by commas.
+
+```sh
+npx wrangler secret put ALERT_TO
+```
+
+**A webhook** gets a POST of JSON, `{"type":"backup.alert","timestamp":…,"data":{"key","subject","text"}}`,
+signed as [Standard Webhooks](https://www.standardwebhooks.com) signs one, so its libraries check
+it. Set two secrets: `ALERT_WEBHOOK_URL`, an https address, and `ALERT_WEBHOOK_SECRET`, at least 24
+random bytes in base64 (`whsec_` in front or not). `webhook-id` is the same each time an alert is
+sent, so the receiver can drop a second copy.
+
+A setting that is there but wrong stops alerts, not backups, and the catalog says which. To check
+that alerts arrive, add `"alert": true` to a run, which sends one even if nothing failed:
+
+```sh
+npx wrangler workflows trigger gateweave-backup '{"sources":["track"],"alert":true}'
+npx wrangler d1 execute gateweave-backup --remote \
+  --command "SELECT key, subject, sent_to, sent_at, error FROM alert ORDER BY made_at DESC LIMIT 5"
+```
+
+`sent_to` lists where it went; it is empty when nothing is set up. An alert that couldn't go keeps
+its `error`, and the daily check sends it again for three days.
+
 ## Retention
 
 `RETENTION` keeps the newest snapshot, the newest of each of the last 7 days, 4 weeks and 12 months

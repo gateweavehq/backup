@@ -32,6 +32,7 @@
 		],
 		"RETENTION": "1l 7d 4w 12m",
 		"RESTORE_TEST_DAYS": "30",
-		"JURISDICTION": ""
+		"JURISDICTION": "",
+		"ALERT_FROM": ""
 	}
 }

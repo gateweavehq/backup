@@ -13,10 +13,11 @@ It is early. Today it backs up D1 databases every night into an R2 bucket:
   snapshots, and keeps 7 daily, 4 weekly and 12 monthly snapshots;
 - every 30 days a restore test reads a new snapshot back, restores it into SQLite and counts every
   table, keeping none of it;
+- a failed, late or stuck backup sends an alert by email, to a signed webhook, or both;
 - a restore CLI, one file for Node, reads the bucket with the key alone and writes SQL for a new D1
   database or a SQLite file, never over anything.
 
-Durable Objects, R2 and KV sources, the copy outside Cloudflare and alerts come next. See [docs/deploy.md](docs/deploy.md), [docs/restore.md](docs/restore.md),
+Durable Objects, R2 and KV sources and the copy outside Cloudflare come next. See [docs/deploy.md](docs/deploy.md), [docs/restore.md](docs/restore.md),
 [docs/architecture.md](docs/architecture.md) and [docs/format.md](docs/format.md).
 
 ## License

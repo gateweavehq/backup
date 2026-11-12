@@ -109,9 +109,11 @@
 			"r2_buckets": [
 				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" }
 			],
-			// Track's workspaces, each in a Durable Object, through Track's Backup entrypoint.
+			// Track's workspaces, and Agents' registries and conversations, each in a Durable Object,
+			// through the apps' Backup entrypoints.
 			"services": [
-				{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" }
+				{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" },
+				{ "binding": "AGENTS_APP", "service": "gateweave-agents", "entrypoint": "Backup" }
 			],
 			"durable_objects": {
 				"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
@@ -133,7 +135,8 @@
 					{ "name": "id", "kind": "d1", "binding": "ID_DB" },
 					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
 					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" },
-					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }
+					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
+					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" }
 				],
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",

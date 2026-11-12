@@ -34,11 +34,11 @@ the same account.
 
 ## Pieces
 
-| Piece                | What it does                                                            |
-| -------------------- | ----------------------------------------------------------------------- |
-| `packages/core`      | The format: keys, sealing, chunking, repositories, SQLite dumps         |
-| `apps/worker`        | Schedules, sources and destinations, the catalog, alerts, restore tests |
-| A restore CLI (next) | Reads a repository with the key and writes the files back               |
+| Piece           | What it does                                                            |
+| --------------- | ----------------------------------------------------------------------- |
+| `packages/core` | The format: keys, sealing, chunking, repositories, SQLite dumps         |
+| `apps/worker`   | Schedules, sources and destinations, the catalog, alerts, restore tests |
+| `packages/cli`  | Reads a repository with the key and writes the files back               |
 
 ### Core
 
@@ -80,6 +80,19 @@ catalog, the lock and retention; the rest of this section is still to come where
   always stays.
 - **Alerts (next):** a failed or late backup sends mail, opens a Track issue or calls a webhook.
 - **MCP (next):** agents can list and check backups. A restore needs a person.
+
+### CLI
+
+[restore.md](restore.md) says how to use it.
+
+- **One file, Node only.** It bundles the format's code, so a restore needs Node.js and that file,
+  nothing from Gateweave. It signs S3 requests itself (SigV4) rather than pulling in an SDK.
+- **Reads only.** The stores it opens refuse every write, so no mistake in it, and no token with more
+  rights than it needs, can change a backup.
+- **Writes only new files.** A restore goes to a folder: SQL for a new D1 database, a SQLite file, or
+  the files as stored. It refuses a name that is taken and removes what it wrote when it fails.
+- **Checks by restoring.** `check` restores each database into memory and counts its rows against
+  the dump, which proves more than reading the bytes.
 
 ## Decisions
 

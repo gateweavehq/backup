@@ -1,0 +1,27 @@
+{
+	"name": "@gateweave/backup-cli",
+	"version": "0.0.0",
+	"private": true,
+	"license": "AGPL-3.0-only",
+	"type": "module",
+	"bin": {
+		"gateweave-backup": "dist/gateweave-backup.mjs"
+	},
+	"engines": {
+		"node": ">=22.13"
+	},
+	"scripts": {
+		"build": "node build.mjs",
+		"typecheck": "tsc && tsc -p test",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@gateweave/backup-core": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "catalog:",
+		"esbuild": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "catalog:"
+	}
+}

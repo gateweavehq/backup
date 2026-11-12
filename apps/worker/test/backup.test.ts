@@ -16,7 +16,15 @@ import {
 } from "@gateweave/backup-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src";
-import { type Alert, checkBackups, deliver, destinationsOf } from "../src/alerts";
+import { when } from "../src/alert-message";
+import {
+	type Alert,
+	checkBackups,
+	deliver,
+	destinationsOf,
+	lateAlert,
+	runAlert,
+} from "../src/alerts";
 import { d1Reader, R2Store } from "../src/bindings";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
@@ -245,17 +253,27 @@ describe("a backup run", () => {
 			made_at: expect.any(Number),
 			subject: "Gateweave Backup: the backup of broken failed",
 			text: expect.any(String),
+			html: expect.stringMatching(/^<!doctype html>/),
 			sent_to: "",
 			sent_at: expect.any(Number),
 			error: null,
 		});
 		expect(String(alert?.text).split("\n")).toEqual([
-			"Backup run all:",
+			"The backup of broken failed.",
+			expect.stringMatching(/^Backup run · \d{1,2} [A-Z][a-z]{2} \d{4}, \d\d:\d\d UTC$/),
 			"",
-			expect.stringMatching(/^- app: snapshot \d{8}T\S+ made, and its restore test passed\.$/),
-			"- broken: the backup failed. Source broken's binding VAULT isn't a D1 database.",
+			"app      Backed up",
+			expect.stringMatching(/^ {9}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			"broken   Failed",
+			"         The backup failed. The snapshots made before it stay.",
+			"         Source broken's binding VAULT isn't a D1 database.",
 			"",
-			"The catalog has more: its run and restore_test tables, under all/<source>.",
+			"The catalog's run and restore_test tables have the details, under this run's id:",
+			"  all",
+			"",
+			"--",
+			expect.stringContaining("runs in your own Cloudflare account"),
+			"",
 		]);
 	});
 
@@ -435,7 +453,7 @@ describe("restore tests", () => {
 				key: "run:unlucky",
 				subject: "Gateweave Backup: the restore test of app failed",
 				text: expect.stringContaining(
-					"made, but its restore test failed. Chunk abc of database.jsonl is missing.\n",
+					"was made, but restoring it failed. The snapshot stays.\n      Chunk abc of database.jsonl is missing.\n",
 				),
 			}),
 		]);
@@ -538,7 +556,12 @@ describe("restore tests", () => {
 
 describe("alerts", () => {
 	const HOUR = 60 * 60 * 1000;
-	const ALERT: Alert = { key: "run:x", subject: "Gateweave Backup: a test", text: "One\nTwo" };
+	const ALERT: Alert = {
+		key: "run:x",
+		subject: "Gateweave Backup: a test",
+		text: "One\nTwo",
+		html: "<p>One</p>",
+	};
 	/** A webhook secret for these tests only: 32 bytes, "gateweave backup alert tests 01!". */
 	const SECRET = "whsec_Z2F0ZXdlYXZlIGJhY2t1cCBhbGVydCB0ZXN0cyAwMSE=";
 
@@ -587,6 +610,7 @@ describe("alerts", () => {
 				to: ["owner@example.com", "second@example.org"],
 				subject: ALERT.subject,
 				text: ALERT.text,
+				html: ALERT.html,
 			},
 		]);
 		const [request] = requests;
@@ -718,21 +742,78 @@ describe("alerts", () => {
 		const day = new Date().toISOString().slice(0, 10);
 		expect(late).toMatchObject({
 			key: `late:${day}`,
-			subject: "Gateweave Backup: backups are late",
+			subject: "Gateweave Backup: the backups of app and broken are late",
 			sent_to: "",
 		});
+		const time = "\\d{1,2} [A-Z][a-z]{2} \\d{4}, \\d\\d:\\d\\d UTC";
 		expect(String(late?.text).split("\n")).toEqual([
-			`On ${day}:`,
+			"The backups of app and broken are late.",
+			expect.stringMatching(new RegExp(`^Daily check · ${time}$`)),
 			"",
-			expect.stringMatching(/^- app: no backup has started since \d{4}-\d\d-\d\dT.+Z\.$/),
-			expect.stringMatching(/^- broken: the backup that started .+Z hasn't ended\.$/),
+			"app      Late",
+			expect.stringMatching(new RegExp(`^ {9}No backup has started since ${time}\\.$`)),
+			"broken   Stuck",
+			expect.stringMatching(new RegExp(`^ {9}The backup that started ${time} hasn't ended\\.$`)),
 			"",
-			"The nightly run didn't start, or stopped part way. The Workflow's instances say which.",
+			"The nightly run didn't start, or stopped part way. The Workflow's instances say which:",
+			"  npx wrangler workflows instances list gateweave-backup",
+			"",
+			"--",
+			expect.any(String),
+			"",
 		]);
 
 		// Once a day, however often the check runs.
 		expect(await checkBackups(env, Date.now())).toEqual({ late: true, sent: 0 });
 		expect(await alerts()).toHaveLength(1);
+	});
+
+	it("read as a card in HTML, with every value they quote escaped", async () => {
+		const at = new Date("2026-11-12T03:07:00Z");
+		expect(when(at)).toBe("12 Nov 2026, 03:07 UTC");
+		const alert = runAlert(
+			"night",
+			[
+				{ source: "id", status: "ok", snapshot: "20261112T030700Z-a1", test: "passed" },
+				{
+					source: "track",
+					status: "failed",
+					error: `INSERT INTO "<script>" failed: 'a' & "b"`,
+				},
+			],
+			false,
+			at,
+		);
+		expect(alert.subject).toBe("Gateweave Backup: the backup of track failed");
+		const html = alert.html ?? "";
+		expect(html).toMatch(/^<!doctype html>/);
+		expect(html).toContain("<title>Gateweave Backup: the backup of track failed</title>");
+		expect(html).toContain("The backup of track failed</h1>");
+		expect(html).toContain("Backup run · 12 Nov 2026, 03:07 UTC");
+		expect(html).toContain(">Backed up</span>");
+		expect(html).toContain(">Failed</span>");
+		// The strip is red when anything failed.
+		expect(html).toContain("background:#f04438");
+		expect(html).not.toContain("<script>");
+		expect(html).toContain(
+			"INSERT INTO &quot;&lt;script&gt;&quot; failed: &#39;a&#39; &amp; &quot;b&quot;",
+		);
+		expect(alert.text).toContain(`INSERT INTO "<script>" failed: 'a' & "b"`);
+		// Nothing for a mail client to load.
+		expect(html).not.toMatch(/<img|<link|src=|url\(/);
+
+		const good = runAlert("asked", [{ source: "id", status: "ok", snapshot: "s" }], true, at);
+		expect(good.subject).toBe("Gateweave Backup: every backup was made (a test alert)");
+		expect(good.html).toContain("background:#17b26a");
+		expect(good.html).toContain("Test alert · 12 Nov 2026, 03:07 UTC");
+
+		await startedRun("app", 2 * HOUR, "ok");
+		await startedRun("broken", 30 * HOUR, "ok");
+		const late = await lateAlert(env, Date.now());
+		expect(late?.subject).toBe("Gateweave Backup: the backup of broken is late");
+		expect(late?.html).toContain("background:#f79009");
+		expect(late?.html).toContain(">On time</span>");
+		expect(late?.html).toContain(">Late</span>");
 	});
 
 	it("stay quiet while every source's backup is on time", async () => {

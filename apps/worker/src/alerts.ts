@@ -1,4 +1,5 @@
 import { toBase64Url } from "@gateweave/backup-core";
+import { type AlertItem, type AlertMessage, renderHtml, renderText, when } from "./alert-message";
 import {
 	alertSent,
 	markAlertFailed,
@@ -21,6 +22,8 @@ export interface Alert {
 	key: string;
 	subject: string;
 	text: string;
+	/** The same, for email. Alerts kept before it existed have none. */
+	html?: string;
 }
 
 /** Where alerts go, from ALERT_FROM and ALERT_TO, and ALERT_WEBHOOK_URL with its secret. */
@@ -119,7 +122,8 @@ export async function deliver(
 	if (destinations.email) {
 		const { binding, from, to } = destinations.email;
 		try {
-			await binding.send({ from, to, subject: alert.subject, text: alert.text });
+			const { subject, text, html } = alert;
+			await binding.send({ from, to, subject, text, ...(html ? { html } : {}) });
 		} catch (error) {
 			throw new Error(`The alert email wasn't sent: ${codeOf(error)}.`);
 		}
@@ -196,37 +200,61 @@ export async function sendAlert(
 	return went;
 }
 
+/** An alert as it is sent: its message as text and as HTML. */
+function compose(key: string, message: AlertMessage, suffix = ""): Alert {
+	const subject = `Gateweave Backup: ${message.heading.charAt(0).toLowerCase()}${message.heading.slice(1)}${suffix}`;
+	return { key, subject, text: renderText(message), html: renderHtml(message, subject) };
+}
+
 /** The alert for a run that failed somewhere, or that asked for one: how every source fared. */
-export function runAlert(instance: string, results: SourceResult[], asked: boolean): Alert {
+export function runAlert(
+	instance: string,
+	results: SourceResult[],
+	asked: boolean,
+	at: Date,
+): Alert {
 	const failed = results.filter((r) => r.status === "failed").map((r) => r.source);
 	const untested = results.filter((r) => r.test === "failed").map((r) => r.source);
 	const problems = [
 		...(failed.length > 0 ? [`the backup of ${list(failed)} failed`] : []),
 		...(untested.length > 0 ? [`the restore test of ${list(untested)} failed`] : []),
 	];
-	const subject =
-		problems.length > 0
-			? `Gateweave Backup: ${problems.join(", and ")}`
-			: `Gateweave Backup: every backup was made${asked ? " (a test alert)" : ""}`;
-	const lines = results.map((r) => {
-		if (r.status === "failed") return `- ${r.source}: the backup failed. ${r.error ?? ""}`.trim();
-		const made = `- ${r.source}: snapshot ${r.snapshot ?? ""} made`;
-		if (r.test === "failed") {
-			return `${made}, but its restore test failed. ${r.testError ?? ""}`.trim();
+	const items = results.map((r): AlertItem => {
+		const { source } = r;
+		if (r.status === "failed") {
+			const detail = "The backup failed. The snapshots made before it stay.";
+			return { source, label: "Failed", tone: "bad", detail, ...(r.error && { error: r.error }) };
 		}
-		return r.test === "passed" ? `${made}, and its restore test passed.` : `${made}.`;
+		const snapshot = `Snapshot ${r.snapshot ?? ""}`;
+		if (r.test === "failed") {
+			const detail = `${snapshot} was made, but restoring it failed. The snapshot stays.`;
+			return {
+				source,
+				label: "Test failed",
+				tone: "bad",
+				detail,
+				...(r.testError && { error: r.testError }),
+			};
+		}
+		const tested = r.test === "passed" ? ", restored and counted by a restore test" : "";
+		return { source, label: "Backed up", tone: "good", detail: `${snapshot}${tested}.` };
 	});
-	return {
-		key: `run:${instance}`,
-		subject,
-		text: [
-			`Backup run ${instance}:`,
-			"",
-			...lines,
-			"",
-			`The catalog has more: its run and restore_test tables, under ${instance}/<source>.`,
-		].join("\n"),
+	const heading = problems.length > 0 ? problems.join(", and ") : "every backup was made";
+	const message: AlertMessage = {
+		tone: problems.length > 0 ? "bad" : "good",
+		heading: `${heading.charAt(0).toUpperCase()}${heading.slice(1)}`,
+		meta: `${asked && problems.length === 0 ? "Test alert" : "Backup run"} · ${when(at)}`,
+		items,
+		more: {
+			text: "The catalog's run and restore_test tables have the details, under this run's id:",
+			code: instance,
+		},
 	};
+	return compose(
+		`run:${instance}`,
+		message,
+		asked && problems.length === 0 ? " (a test alert)" : "",
+	);
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -242,34 +270,53 @@ const STUCK_MS = 5 * HOUR_MS;
 
 /**
  * The alert for backups that didn't happen: a source whose newest run started over LATE_MS ago,
- * or that has none, or whose newest run has been going for over STUCK_MS. A run that fails sends its own alert; this
- * catches the runs that never got that far. Undefined when every source is on time.
+ * or that has none, or whose newest run has been going for over STUCK_MS. A run that fails sends
+ * its own alert; this catches the runs that never got that far. It lists the sources on time too.
+ * Undefined when every source is on time.
  */
 export async function lateAlert(env: Env, now: number): Promise<Alert | undefined> {
-	const lines: string[] = [];
-	for (const { name } of parseSources(env.SOURCES)) {
-		const run = await newestRun(env.CATALOG, name);
-		const started = run ? new Date(run.startedAt).toISOString() : "";
-		if (!run) lines.push(`- ${name}: no backup has started yet.`);
-		else if (run.status === "running" && run.startedAt < now - STUCK_MS) {
-			lines.push(`- ${name}: the backup that started ${started} hasn't ended.`);
+	const items: AlertItem[] = [];
+	const late: string[] = [];
+	for (const { name: source } of parseSources(env.SOURCES)) {
+		const run = await newestRun(env.CATALOG, source);
+		if (!run) {
+			late.push(source);
+			items.push({
+				source,
+				label: "Never ran",
+				tone: "late",
+				detail: "No backup has started yet.",
+			});
+			continue;
+		}
+		const started = when(run.startedAt);
+		if (run.status === "running" && run.startedAt < now - STUCK_MS) {
+			late.push(source);
+			const detail = `The backup that started ${started} hasn't ended.`;
+			items.push({ source, label: "Stuck", tone: "late", detail });
 		} else if (run.startedAt < now - LATE_MS) {
-			lines.push(`- ${name}: no backup has started since ${started}.`);
+			late.push(source);
+			const detail = `No backup has started since ${started}.`;
+			items.push({ source, label: "Late", tone: "late", detail });
+		} else {
+			items.push({ source, label: "On time", tone: "good", detail: `Last started ${started}.` });
 		}
 	}
-	if (lines.length === 0) return undefined;
+	if (late.length === 0) return undefined;
 	const day = new Date(now).toISOString().slice(0, 10);
-	return {
-		key: `late:${day}`,
-		subject: "Gateweave Backup: backups are late",
-		text: [
-			`On ${day}:`,
-			"",
-			...lines,
-			"",
-			"The nightly run didn't start, or stopped part way. The Workflow's instances say which.",
-		].join("\n"),
-	};
+	return compose(`late:${day}`, {
+		tone: "late",
+		heading:
+			late.length === 1
+				? `The backup of ${late[0]} is late`
+				: `The backups of ${list(late)} are late`,
+		meta: `Daily check · ${when(now)}`,
+		items,
+		more: {
+			text: "The nightly run didn't start, or stopped part way. The Workflow's instances say which:",
+			code: "npx wrangler workflows instances list gateweave-backup",
+		},
+	});
 }
 
 /** How long the daily check keeps trying an alert that didn't go. */

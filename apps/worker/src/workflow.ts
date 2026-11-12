@@ -91,7 +91,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		];
 		const asked = event.payload?.alert === true;
 		if (problems.length > 0 || asked) {
-			await this.#alert(runAlert(event.instanceId, results, asked), step);
+			await this.#alert(() => runAlert(event.instanceId, results, asked, new Date()), step);
 		}
 		// A run that made every snapshot but couldn't restore one shows as failed too.
 		if (problems.length > 0) throw new Error(`${problems.join(" ")} The catalog says why.`);
@@ -102,9 +102,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	 * Keeps the alert in the catalog, then sends it. One that can't be sent stays there with why,
 	 * and the next morning's check (alerts.ts) tries it again; the run goes on to end as it would.
 	 */
-	async #alert(alert: Alert, step: WorkflowStep) {
+	async #alert(make: () => Alert, step: WorkflowStep) {
 		const db = this.env.CATALOG;
-		await step.do("alert", QUICK, () => recordAlert(db, alert, Date.now()));
+		// Made inside the step, so its time is the one kept, however often the run is replayed.
+		const alert = await step.do("alert", QUICK, async () => {
+			const made = make();
+			await recordAlert(db, made, Date.now());
+			return made;
+		});
 		try {
 			await step.do("alert: send", ALERT, () =>
 				sendAlert(this.env, alert).catch((error: unknown) => {

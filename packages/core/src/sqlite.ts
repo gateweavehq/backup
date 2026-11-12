@@ -6,6 +6,9 @@
  * Object). If the schema changed between the rounds, the dump starts over.
  */
 
+/** The file a SQLite source's snapshot holds its dump in. */
+export const DUMP_FILE = "database.jsonl";
+
 export type Row = Record<string, unknown>;
 
 /** Runs read-only statements together, as one consistent read, and returns each one's rows. */
@@ -313,6 +316,76 @@ export function* restoreSql(lines: Iterable<string>): Generator<string> {
 	}
 	if (number === 0) throw new DumpError("The dump is empty.");
 	if (!ended) throw new DumpError("The dump stops before its end: it is incomplete.");
+}
+
+export interface TableSummary {
+	name: string;
+	rows: number;
+	/** A virtual table, such as an FTS5 index, whose rows may be rebuilt rather than listed. */
+	virtual: boolean;
+}
+
+export interface DumpSummary {
+	/** Whether every row was read at the same moment. */
+	consistent: boolean;
+	tables: TableSummary[];
+	rows: number;
+}
+
+/** What a dump holds: its tables and how many rows each has. Names and counts, never values. */
+export function summarizeDump(lines: readonly string[]): DumpSummary {
+	const summary: DumpSummary = { consistent: false, tables: [], rows: 0 };
+	const byName = new Map<string, TableSummary>();
+	let ended = false;
+	lines.forEach((text, index) => {
+		if (text.trim() === "") return;
+		let line: { k?: unknown; name?: unknown; t?: unknown; consistent?: unknown };
+		try {
+			line = JSON.parse(text);
+		} catch {
+			throw new DumpError(`Line ${index + 1} of the dump is not a dump line.`);
+		}
+		if (line.k === "head") summary.consistent = line.consistent === true;
+		else if ((line.k === "table" || line.k === "virtual") && typeof line.name === "string") {
+			const table = { name: line.name, rows: 0, virtual: line.k === "virtual" };
+			byName.set(line.name, table);
+			summary.tables.push(table);
+		} else if (line.k === "row" && typeof line.t === "string") {
+			const table = byName.get(line.t);
+			if (!table)
+				throw new DumpError(`Line ${index + 1} has a row for a table the dump hasn't made.`);
+			table.rows++;
+			summary.rows++;
+		} else if (line.k === "end") ended = true;
+	});
+	if (!ended) throw new DumpError("The dump stops before its end: it is incomplete.");
+	return summary;
+}
+
+/** A name as SQL writes it: quoted in any of SQLite's ways, or bare. */
+const NAME = /"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[^\s(,;]+/.source;
+
+/** The start of each statement a restore makes, up to the object it is about. */
+const STATEMENT_START = new RegExp(
+	[
+		`CREATE\\s+(?:UNIQUE\\s+|VIRTUAL\\s+|TEMP(?:ORARY)?\\s+)*(?:TABLE|INDEX|TRIGGER|VIEW)\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?:${NAME})`,
+		`INSERT\\s+INTO\\s+(?:${NAME})`,
+		`DELETE\\s+FROM\\s+(?:${NAME})`,
+		`PRAGMA\\s+\\w+`,
+	]
+		.map((start) => `^\\s*${start}`)
+		.join("|"),
+	"i",
+);
+
+/**
+ * A restore statement by what it does and to which object, such as `INSERT INTO "person"`: what an
+ * error about a statement may say. Never its values, and never the rest of a view's or a trigger's
+ * SQL, which may hold literals.
+ */
+export function describeStatement(statement: string): string {
+	const start = STATEMENT_START.exec(statement)?.[0] ?? statement.trim().split(/\s/)[0] ?? "";
+	return start.trim().replace(/\s+/g, " ").slice(0, 120);
 }
 
 /** A dump's lines as one file, and back. */

@@ -1,3 +1,4 @@
+export { RestoreTest } from "./restore-test";
 export { BackupWorkflow } from "./workflow";
 
 /**

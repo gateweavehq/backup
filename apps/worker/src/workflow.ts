@@ -6,6 +6,7 @@ import {
 } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import {
+	DUMP_FILE,
 	dumpSqlite,
 	parseMasterKey,
 	parseRetention,
@@ -19,27 +20,31 @@ import {
 	failRun,
 	finishRun,
 	recordSnapshot,
+	recordTest,
 	releaseLock,
 	type SnapshotRecord,
 	startRun,
 	takeLock,
+	testDue,
 } from "./catalog";
+import { type RestoreTestResult, testerFor, testInterval } from "./restore-test";
 import { parseSources, pickSources, type Source } from "./sources";
 
 /** A manual run may name its sources; a scheduled one backs up all of them. */
 export interface BackupParams {
 	sources?: string[];
+	/** Restore-test each new snapshot, whether or not a test is due. */
+	test?: boolean;
 }
 
 export interface SourceResult {
 	source: string;
 	status: "ok" | "failed";
 	snapshot?: string;
+	/** How the restore test of the new snapshot went, when there was one. */
+	test?: "passed" | "failed";
 	error?: string;
 }
-
-/** The dump's file in a snapshot: docs/format.md, "SQLite dumps". */
-const DUMP_FILE = "database.jsonl";
 
 /** Catalog writes are small, and D1 hiccups pass. */
 const QUICK: WorkflowStepConfig = {
@@ -61,15 +66,27 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	override async run(event: Readonly<WorkflowEvent<BackupParams | undefined>>, step: WorkflowStep) {
 		const sources = pickSources(parseSources(this.env.SOURCES), event.payload?.sources);
 		const results: SourceResult[] = [];
-		for (const source of sources) results.push(await this.#backUp(event.instanceId, source, step));
-		const failed = results.filter((r) => r.status === "failed").map((r) => r.source);
-		if (failed.length > 0) {
-			throw new Error(`The backup of ${failed.join(", ")} failed. The catalog says why.`);
+		const force = event.payload?.test === true;
+		for (const source of sources) {
+			results.push(await this.#backUp(event.instanceId, source, step, force));
 		}
+		const failed = results.filter((r) => r.status === "failed").map((r) => r.source);
+		const untested = results.filter((r) => r.test === "failed").map((r) => r.source);
+		const problems = [
+			...(failed.length > 0 ? [`The backup of ${failed.join(", ")} failed.`] : []),
+			...(untested.length > 0 ? [`The restore test of ${untested.join(", ")} failed.`] : []),
+		];
+		// A run that made every snapshot but couldn't restore one shows as failed too.
+		if (problems.length > 0) throw new Error(`${problems.join(" ")} The catalog says why.`);
 		return results;
 	}
 
-	async #backUp(instance: string, source: Source, step: WorkflowStep): Promise<SourceResult> {
+	async #backUp(
+		instance: string,
+		source: Source,
+		step: WorkflowStep,
+		force: boolean,
+	): Promise<SourceResult> {
 		const db = this.env.CATALOG;
 		const id = `${instance}/${source.name}`;
 		const name = source.name;
@@ -88,11 +105,13 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			await step.do(`${name}: record`, QUICK, () => recordSnapshot(db, id, record));
 			const made = record.name;
 			const pruned = await step.do(`${name}: prune`, HEAVY, () => this.#prune(source, made));
+			// After the prune and under the lock, so the test also proves the prune left what it needs.
+			const test = await this.#testIfDue(id, name, made, step, force);
 			await step.do(`${name}: finish`, QUICK, async () => {
 				await finishRun(db, { id, source: name, at: Date.now(), ...pruned });
 				await releaseLock(db, name, instance);
 			});
-			return { source: name, status: "ok", snapshot };
+			return { source: name, status: "ok", snapshot, ...(test ? { test } : {}) };
 		} catch (error) {
 			const reason = describe(error);
 			const message = snapshot ? `Snapshot ${snapshot} was made, but then: ${reason}` : reason;
@@ -102,6 +121,50 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			});
 			return { source: name, status: "failed", snapshot, error: message };
 		}
+	}
+
+	/**
+	 * Restores the snapshot just made, when the source's last passed test is RESTORE_TEST_DAYS old
+	 * or it has none. Its outcome goes to the catalog, and a failure doesn't undo the backup.
+	 */
+	async #testIfDue(
+		runId: string,
+		name: string,
+		snapshot: string,
+		step: WorkflowStep,
+		force: boolean,
+	): Promise<"passed" | "failed" | undefined> {
+		const db = this.env.CATALOG;
+		const failed = (error: string): RestoreTestResult => ({
+			source: name,
+			snapshot,
+			passed: false,
+			tables: 0,
+			rows: 0,
+			size: 0,
+			error,
+		});
+		let result: RestoreTestResult | undefined;
+		try {
+			const due = await step.do(`${name}: test due`, QUICK, async () => {
+				const days = setting(() => testInterval(this.env.RESTORE_TEST_DAYS));
+				return force || (await testDue(db, name, Date.now(), days));
+			});
+			if (!due) return undefined;
+		} catch (error) {
+			// Recorded as a failed test, so a setting that stops every test shows in the catalog.
+			result = failed(`The test didn't start: ${describe(error)}`);
+		}
+		try {
+			result ??= await step.do(`${name}: restore test`, HEAVY, async () => {
+				const tester = setting(() => testerFor(this.env, name));
+				return (await tester.restore(name, snapshot)) as RestoreTestResult;
+			});
+		} catch (error) {
+			result = failed(describe(error));
+		}
+		await step.do(`${name}: test recorded`, QUICK, () => recordTest(db, runId, result, Date.now()));
+		return result.passed ? "passed" : "failed";
 	}
 
 	/** Dumps the source and commits the dump as a snapshot. */
@@ -134,13 +197,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	 * snapshot this run made always stays, whatever a clock that went back says about its age.
 	 */
 	async #prune(source: Source, made: string) {
-		const policy = (() => {
-			try {
-				return parseRetention(this.env.RETENTION);
-			} catch (error) {
-				throw new NonRetryableError(error instanceof Error ? error.message : String(error));
-			}
-		})();
+		const policy = setting(() => parseRetention(this.env.RETENTION));
 		const repo = await this.#repository(source);
 		const forget = retain(await repo.snapshots(), policy).forget.filter((name) => name !== made);
 		const forgotten: string[] = [];
@@ -194,6 +251,15 @@ async function* encodeLines(lines: string[]): AsyncGenerator<Uint8Array<ArrayBuf
 		}
 	}
 	if (batch.length > 0) yield utf8(`${batch.join("\n")}\n`);
+}
+
+/** Reads a setting, so that one the Worker can't use fails at once rather than after retries. */
+function setting<T>(read: () => T): T {
+	try {
+		return read();
+	} catch (error) {
+		throw new NonRetryableError(error instanceof Error ? error.message : String(error));
+	}
 }
 
 /**

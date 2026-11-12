@@ -1,14 +1,18 @@
-import { introspectWorkflowInstance } from "cloudflare:test";
+import { introspectWorkflowInstance, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import {
+	dumpSqlite,
 	fromUtf8,
 	generateMasterKey,
+	joinLines,
 	Repository,
 	restoreSql,
 	splitLines,
+	utf8,
 } from "@gateweave/backup-core";
 import { beforeEach, describe, expect, it } from "vitest";
-import { R2Store } from "../src/bindings";
+import { d1Reader, R2Store } from "../src/bindings";
+import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
 
 const PEOPLE = [
@@ -23,7 +27,12 @@ async function clear(db: D1Database) {
 			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name <> 'd1_migrations'",
 		)
 		.all<{ name: string }>();
-	for (const { name } of tables.results) await db.prepare(`DROP TABLE "${name}"`).run();
+	// In one transaction with foreign keys checked at its end, so the order of the tables is no matter.
+	// An FTS5 table's own tables go with it, hence IF EXISTS.
+	await db.batch([
+		db.prepare("PRAGMA defer_foreign_keys = on"),
+		...tables.results.map(({ name }) => db.prepare(`DROP TABLE IF EXISTS "${name}"`)),
+	]);
 }
 
 beforeEach(async () => {
@@ -33,6 +42,7 @@ beforeEach(async () => {
 		env.CATALOG.prepare("DELETE FROM run"),
 		env.CATALOG.prepare("DELETE FROM snapshot"),
 		env.CATALOG.prepare("DELETE FROM lock"),
+		env.CATALOG.prepare("DELETE FROM restore_test"),
 	]);
 	const listed = await env.VAULT.list();
 	if (listed.objects.length > 0) await env.VAULT.delete(listed.objects.map((o) => o.key));
@@ -44,11 +54,15 @@ beforeEach(async () => {
 	]);
 });
 
+type Instance = Awaited<ReturnType<typeof introspectWorkflowInstance>>;
+type Modifier = Parameters<Parameters<Instance["modify"]>[0]>[0];
+
 /** Runs the Workflow to its end and says how it ended. */
-async function backUp(id: string, params?: BackupParams) {
+async function backUp(id: string, params?: BackupParams, change?: (m: Modifier) => Promise<void>) {
 	await using instance = await introspectWorkflowInstance(env.BACKUP, id);
 	await instance.modify(async (m) => {
 		await m.disableRetryDelays();
+		await change?.(m);
 	});
 	await env.BACKUP.create({ id, params });
 	// The wait that loses the race is rejected when the instance is disposed.
@@ -91,7 +105,14 @@ describe("a backup run", () => {
 		const result = await backUp("first", { sources: ["app"] });
 		expect(result).toEqual({
 			ended: "complete",
-			output: [{ source: "app", status: "ok", snapshot: expect.stringMatching(/^\d{8}T/) }],
+			output: [
+				{
+					source: "app",
+					status: "ok",
+					snapshot: expect.stringMatching(/^\d{8}T/),
+					test: "passed",
+				},
+			],
 		});
 
 		const repo = await repository();
@@ -233,6 +254,222 @@ describe("a backup run", () => {
 		expect(result.ended).toBe("errored");
 		expect(result.error?.message).toContain("There is no source named nope.");
 		expect(await runs()).toEqual([]);
+	});
+});
+
+/** A schema with what a restore must get right: foreign keys, AUTOINCREMENT, FTS5 and a trigger. */
+async function addTeams() {
+	await env.SOURCE_DB.batch(
+		[
+			"CREATE TABLE team (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)",
+			"CREATE TABLE member (team INTEGER NOT NULL REFERENCES team (id), person INTEGER NOT NULL REFERENCES person (id), PRIMARY KEY (team, person))",
+			"CREATE VIRTUAL TABLE person_search USING fts5 (email, note, content = 'person', content_rowid = 'id')",
+			"CREATE TRIGGER person_added AFTER INSERT ON person BEGIN INSERT INTO person_search (rowid, email, note) VALUES (new.id, new.email, new.note); END",
+			"INSERT INTO team (name) VALUES ('core'), ('docs')",
+			"INSERT INTO member (team, person) VALUES (1, 1), (1, 2), (2, 3)",
+			"INSERT INTO person_search (person_search) VALUES ('rebuild')",
+		].map((sql) => env.SOURCE_DB.prepare(sql)),
+	);
+}
+
+async function tests() {
+	return (await env.CATALOG.prepare("SELECT * FROM restore_test ORDER BY tested_at, run").all())
+		.results;
+}
+
+/** The tables in a restore test object's own database, which must stay empty. */
+async function testerTables(source: string) {
+	return runInDurableObject(testerFor(env, source), (_, state) =>
+		state.storage.sql
+			.exec<{ name: string }>("SELECT name FROM sqlite_master")
+			.toArray()
+			.map((row) => row.name)
+			.filter((name) => !name.startsWith("_cf_") && !name.startsWith("__cf_")),
+	);
+}
+
+/** A repository for `source` holding one snapshot of `lines`, as a backup would write it. */
+async function commitDump(source: string, lines: string[]) {
+	const repo = await Repository.init(new R2Store(env.VAULT, `${source}/`), env.BACKUP_KEY);
+	const { entry } = await repo.writeFile("database.jsonl", utf8(joinLines(lines)));
+	return (await repo.commit({ kind: "d1", name: source }, [entry], {})).name;
+}
+
+describe("restore tests", () => {
+	it("restore a source's first snapshot, count it, and keep none of it", async () => {
+		await addTeams();
+		const result = await backUp("tested", { sources: ["app"] });
+		expect(result).toMatchObject({ ended: "complete", output: [{ test: "passed" }] });
+		const [snapshot] = await (await repository()).snapshots();
+		expect(await tests()).toEqual([
+			expect.objectContaining({
+				run: "tested/app",
+				source: "app",
+				snapshot,
+				status: "passed",
+				table_count: 4,
+				row_count: 8,
+				size: expect.any(Number),
+				error: null,
+			}),
+		]);
+		expect(await testerTables("app")).toEqual([]);
+	});
+
+	it("clear away what a test that stopped half way left", async () => {
+		await runInDurableObject(testerFor(env, "app"), (_, state) => {
+			state.storage.sql.exec("CREATE TABLE person (id INTEGER PRIMARY KEY)");
+		});
+		const result = await backUp("after-a-stop", { sources: ["app"] });
+		expect(result).toMatchObject({ ended: "complete", output: [{ test: "passed" }] });
+		expect(await testerTables("app")).toEqual([]);
+	});
+
+	it("come round again when the last one that passed is RESTORE_TEST_DAYS old", async () => {
+		await backUp("first-night", { sources: ["app"] });
+		const second = await backUp("second-night", { sources: ["app"] });
+		expect(second).toEqual({
+			ended: "complete",
+			output: [expect.not.objectContaining({ test: expect.anything() })],
+		});
+		expect(await tests()).toHaveLength(1);
+
+		const days = testInterval(env.RESTORE_TEST_DAYS);
+		const hour = 60 * 60 * 1000;
+		const passedAgo = (ms: number) =>
+			env.CATALOG.prepare("UPDATE restore_test SET tested_at = ?1")
+				.bind(Date.now() - ms)
+				.run();
+		await passedAgo((days * 24 - 13) * hour);
+		await backUp("not-yet", { sources: ["app"] });
+		expect(await tests()).toHaveLength(1);
+
+		// Half a day early, so a nightly run that reaches the test a little sooner doesn't wait a night.
+		await passedAgo((days * 24 - 11) * hour);
+		const third = await backUp("a-month-on", { sources: ["app"] });
+		expect(third).toMatchObject({ ended: "complete", output: [{ test: "passed" }] });
+		expect(await tests()).toHaveLength(2);
+	});
+
+	it("run whenever a run asks for one", async () => {
+		await backUp("first", { sources: ["app"] });
+		await backUp("asked", { sources: ["app"], test: true });
+		expect((await tests()).map((t) => t.run)).toEqual(["first/app", "asked/app"]);
+	});
+
+	it("fail the run when one fails, and keep the backup, the catalog and the lock right", async () => {
+		const result = await backUp("unlucky", { sources: ["app"] }, (m) =>
+			m.mockStepError(
+				{ name: "app: restore test" },
+				new Error("Chunk abc of database.jsonl is missing."),
+			),
+		);
+		expect(result.ended).toBe("errored");
+		expect(result.error?.message).toBe("The restore test of app failed. The catalog says why.");
+		expect(await runs()).toEqual([expect.objectContaining({ status: "ok", error: null })]);
+		expect(await tests()).toEqual([
+			expect.objectContaining({
+				status: "failed",
+				error: "Chunk abc of database.jsonl is missing.",
+				row_count: 0,
+			}),
+		]);
+		expect((await env.CATALOG.prepare("SELECT * FROM lock").all()).results).toEqual([]);
+		expect(await (await repository()).snapshots()).toHaveLength(1);
+
+		// A failed test is due again the next night.
+		expect((await backUp("next-night", { sources: ["app"] })).output).toEqual([
+			expect.objectContaining({ test: "passed" }),
+		]);
+	});
+
+	it("fail a snapshot whose chunk was changed", async () => {
+		await backUp("made", { sources: ["app"] });
+		const [snapshot] = await (await repository()).snapshots();
+		const chunks = await env.VAULT.list({ prefix: "app/data/" });
+		const [chunk] = chunks.objects;
+		if (!snapshot || !chunk) throw new Error("The backup made nothing.");
+		await env.VAULT.put(chunk.key, new Uint8Array(64));
+
+		const test = await testerFor(env, "app").restore("app", snapshot);
+		expect(test).toMatchObject({ passed: false, rows: 0 });
+		expect(test.error).toMatch(
+			/could not be opened: the key is wrong, or the object was changed\.$/,
+		);
+	});
+
+	it("fail a dump whose rows point to rows that aren't there, naming only the table", async () => {
+		await addTeams();
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		// Without its first team, two members point nowhere.
+		const team = lines.findIndex((line) => line.startsWith('{"k":"row","t":"team"'));
+		expect(team).toBeGreaterThan(0);
+		const ended = (line: string) =>
+			line.replace(/"rows":(\d+)/, (_, n: string) => `"rows":${Number(n) - 1}`);
+		const broken = lines
+			.filter((_, index) => index !== team)
+			.map((line) => (line.startsWith('{"k":"end"') ? ended(line) : line));
+		const snapshot = await commitDump("crafted", broken);
+
+		const test = await testerFor(env, "crafted").restore("crafted", snapshot);
+		expect(test).toEqual({
+			source: "crafted",
+			snapshot,
+			passed: false,
+			tables: 0,
+			rows: 0,
+			size: expect.any(Number),
+			error: "2 rows point to rows that aren't there, the first in member.",
+		});
+		expect(await testerTables("crafted")).toEqual([]);
+	});
+
+	it("take one at a time, so a second try of a step doesn't trip over the first", async () => {
+		await addTeams();
+		await backUp("made", { sources: ["app"] });
+		const [snapshot] = await (await repository()).snapshots();
+		const tester = testerFor(env, "app");
+		const both = await Promise.all([
+			tester.restore("app", snapshot ?? ""),
+			tester.restore("app", snapshot ?? ""),
+		]);
+		expect(both.map((test) => test.error ?? "passed")).toEqual(["passed", "passed"]);
+	});
+
+	it("fail a row SQLite refuses, naming the table and column but no value", async () => {
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const person = lines.find((line) => line.startsWith('{"k":"row","t":"person"')) ?? "";
+		const at = lines.indexOf(person);
+		const ended = (line: string) =>
+			line.replace(/"rows":(\d+)/, (_, n: string) => `"rows":${Number(n) + 1}`);
+		const twice = [...lines.slice(0, at), person, ...lines.slice(at)].map((line) =>
+			line.startsWith('{"k":"end"') ? ended(line) : line,
+		);
+		const snapshot = await commitDump("twice", twice);
+
+		const test = await testerFor(env, "twice").restore("twice", snapshot);
+		expect(test.error).toMatch(
+			/^INSERT INTO "person" failed: UNIQUE constraint failed: person\.id/,
+		);
+		expect(test.error).not.toContain("example.com");
+		expect(await testerTables("twice")).toEqual([]);
+	});
+
+	it("fail a dump that stops before its end", async () => {
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const snapshot = await commitDump("cut", lines.slice(0, -1));
+		const test = await testerFor(env, "cut").restore("cut", snapshot);
+		expect(test.error).toBe("The dump stops before its end: it is incomplete.");
+		expect(await testerTables("cut")).toEqual([]);
+	});
+
+	it("read RESTORE_TEST_DAYS as whole days", () => {
+		expect(testInterval(undefined)).toBe(30);
+		expect(testInterval("")).toBe(30);
+		expect(testInterval("7")).toBe(7);
+		for (const bad of ["0", "1.5", "a week", "400"]) {
+			expect(() => testInterval(bad), bad).toThrow("RESTORE_TEST_DAYS must be");
+		}
 	});
 });
 

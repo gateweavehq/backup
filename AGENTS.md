@@ -14,7 +14,7 @@ touching anything that reads or writes a repository.
 | Path            | What lives there                                                        |
 | --------------- | ----------------------------------------------------------------------- |
 | `packages/core` | The repository format: keys, sealing, chunking, SQLite dumps, retention |
-| `apps/worker`   | The Worker: the backup Workflow, R2 and D1 bindings, the catalog        |
+| `apps/worker`   | The Worker: the backup Workflow, restore tests, bindings, the catalog   |
 | `packages/cli`  | The restore CLI: reads a repository with the key, writes files back     |
 | `docs/`         | Architecture, the format, deploying and restoring                       |
 | `scripts/`      | `keygen`                                                                |
@@ -39,7 +39,9 @@ Requirements: Node.js 24 (see `.node-version`; 22.13+ works) and pnpm 12.
    follows it; a change to it is a new format version, never an edit to version 1.
 2. **Old backups always restore.** A test reads repositories made by earlier code. Never weaken it.
 3. **The key never leaves the owner's hands.** Nothing writes the master key, a derived key or a
-   plaintext chunk anywhere but memory. Errors name objects, never their contents or the key.
+   plaintext chunk anywhere but memory. A restore test's rows go into a Durable Object's SQLite only
+   inside a transaction that is always rolled back. Errors name objects, never their contents or
+   the key.
 4. **Never restore over live data.** Restores write to a new database or bucket. The CLI only reads
    a repository and writes only files that aren't there yet.
 5. **Sealing is authenticated.** Every blob is AES-GCM with its label in the additional data.
@@ -61,7 +63,9 @@ Requirements: Node.js 24 (see `.node-version`; 22.13+ works) and pnpm 12.
 - `packages/cli` tests run the CLI against a repository in a folder and behind a stand-in S3
   server, restore it, and run the bundle with Node as an owner would.
 - `apps/worker` tests run in workerd (`@cloudflare/vitest-plugin`): a real Workflow backs up a real
-  D1 database into R2, and the test restores it into another. Their key is public and only theirs.
+  D1 database into R2, and the test restores it into another. Restore tests run in a real Durable
+  Object. workerd has no jurisdictions, so the tests leave `JURISDICTION` empty. Their key is public
+  and only theirs.
 - A Workflow step's error comes back with its class name in front; the catalog stores it without.
 
 ## Git

@@ -26,6 +26,14 @@
 			"bucket_name": "gateweave-backup"
 		}
 	],
+	// Restore tests restore a snapshot into a Durable Object's SQLite and roll it back: one object
+	// per source.
+	"durable_objects": {
+		"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
+	},
+	"exports": {
+		"RestoreTest": { "type": "durable-object", "storage": "sqlite" }
+	},
 	"workflows": [
 		{
 			"name": "gateweave-backup",
@@ -44,7 +52,13 @@
 		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" }]
 		"SOURCES": [],
 		// The newest snapshot, then one a day for 7 days, a week for 4 weeks, a month for 12 months.
-		"RETENTION": "1l 7d 4w 12m"
+		"RETENTION": "1l 7d 4w 12m",
+		// Days between restore tests of a source. A run tests the snapshot it made when the source's
+		// last passed test is this old, or it has none, so a failed test is tried again the next night.
+		"RESTORE_TEST_DAYS": "30",
+		// Where restore tests run: "eu" or "fedramp" to keep them in the bucket's jurisdiction, or
+		// empty for anywhere.
+		"JURISDICTION": ""
 	},
 	"secrets": {
 		// The master key, from `pnpm keygen`. Keep a copy somewhere safe: without it, no backup
@@ -84,6 +98,9 @@
 			"r2_buckets": [
 				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" }
 			],
+			"durable_objects": {
+				"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
+			},
 			"workflows": [
 				{
 					"name": "gateweave-backup",
@@ -99,7 +116,9 @@
 					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
 					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" }
 				],
-				"RETENTION": "1l 7d 3w"
+				"RETENTION": "1l 7d 3w",
+				"RESTORE_TEST_DAYS": "30",
+				"JURISDICTION": "eu"
 			},
 			"secrets": { "required": ["BACKUP_KEY"] }
 		}

@@ -1,7 +1,9 @@
 /**
- * The catalog in D1 (migrations/0001_catalog.sql). Every write here is safe to repeat, since a
+ * The catalog in D1 (migrations/). Every write here is safe to repeat, since a
  * Workflow step that wrote and then failed runs again.
  */
+
+import type { RestoreTestResult } from "./restore-test";
 
 /** Long enough for any run; a run that died holding the lock frees it when this runs out. */
 export const LEASE_MS = 12 * 60 * 60 * 1000;
@@ -119,5 +121,54 @@ export async function failRun(
 	await db
 		.prepare("UPDATE run SET status = 'failed', finished_at = ?2, error = ?3 WHERE id = ?1")
 		.bind(run.id, run.at, run.error.slice(0, ERROR_LENGTH))
+		.run();
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Nightly runs reach a source's test a little earlier or later each night, so a test is due half a
+ * day early rather than a night late.
+ */
+const DUE_EARLY_MS = 12 * 60 * 60 * 1000;
+
+/** Whether the source's restore test is due: it has never passed, or not for `days` days. */
+export async function testDue(
+	db: D1Database,
+	source: string,
+	now: number,
+	days: number,
+): Promise<boolean> {
+	const last = await db
+		.prepare(
+			"SELECT max(tested_at) AS at FROM restore_test WHERE source = ?1 AND status = 'passed'",
+		)
+		.bind(source)
+		.first<number | null>("at");
+	return last === null || last <= now - days * DAY_MS + DUE_EARLY_MS;
+}
+
+export async function recordTest(
+	db: D1Database,
+	runId: string,
+	test: RestoreTestResult,
+	at: number,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO restore_test (run, source, snapshot, tested_at, status, table_count, row_count,
+				size, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (run) DO NOTHING`,
+		)
+		.bind(
+			runId,
+			test.source,
+			test.snapshot,
+			at,
+			test.passed ? "passed" : "failed",
+			test.tables,
+			test.rows,
+			test.size,
+			test.error?.slice(0, ERROR_LENGTH) ?? null,
+		)
 		.run();
 }

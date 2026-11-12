@@ -178,9 +178,10 @@ export async function recordTest(
 export async function recordAlert(db: D1Database, alert: Alert, at: number): Promise<void> {
 	await db
 		.prepare(
-			"INSERT INTO alert (key, made_at, subject, text) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (key) DO NOTHING",
+			`INSERT INTO alert (key, made_at, subject, text, html) VALUES (?1, ?2, ?3, ?4, ?5)
+			ON CONFLICT (key) DO NOTHING`,
 		)
-		.bind(alert.key, at, alert.subject, alert.text)
+		.bind(alert.key, at, alert.subject, alert.text, alert.html ?? null)
 		.run();
 }
 
@@ -216,11 +217,11 @@ export async function markAlertFailed(db: D1Database, key: string, error: string
 export async function unsentAlerts(db: D1Database, since: number): Promise<Alert[]> {
 	const { results } = await db
 		.prepare(
-			"SELECT key, subject, text FROM alert WHERE sent_at IS NULL AND made_at >= ?1 ORDER BY made_at, key",
+			"SELECT key, subject, text, html FROM alert WHERE sent_at IS NULL AND made_at >= ?1 ORDER BY made_at, key",
 		)
 		.bind(since)
-		.all<Alert>();
-	return results;
+		.all<Alert & { html: string | null }>();
+	return results.map(({ html, ...alert }) => (html ? { ...alert, html } : alert));
 }
 
 /** The source's newest run: when it started and how it stands. Null if it has none. */

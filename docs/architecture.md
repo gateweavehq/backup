@@ -96,7 +96,8 @@ catalog, the lock and retention; the rest of this section is still to come where
   one that asks for it (`"alert": true`). The Worker's own cron checks each morning, six hours after
   the nightly run, that every source's newest backup started in the last 26 hours and hasn't been
   going for over 5, and alerts if not: that catches the runs that never got far enough to send their
-  own. An alert goes by email through Email Service's binding and to a webhook signed as Standard
+  own. An alert goes by email through Email Service's binding, as text and as an HTML card with no
+  images or links to load, and to a webhook signed as Standard
   Webhooks signs one, whichever are set up. It is written to the catalog under its key
   (`run:<instance>` or `late:<day>`) before it is sent and marked when it has gone, so a retried step
   doesn't send it twice. One that can't be sent stays there with why, the run ends as it would have,

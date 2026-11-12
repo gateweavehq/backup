@@ -4,7 +4,10 @@ import { copyFile, type FileHandle, link, mkdir, open, stat, unlink } from "node
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
+	DUMP_FILE,
 	DumpError,
+	type DumpSummary,
+	describeStatement,
 	type FileEntry,
 	fromUtf8,
 	ident,
@@ -13,10 +16,8 @@ import {
 	RepositoryError,
 	restoreSql,
 	splitLines,
+	summarizeDump,
 } from "@gateweave/backup-core";
-
-/** The file a SQLite source's snapshot holds: docs/format.md, "SQLite dumps". */
-export const DUMP_FILE = "database.jsonl";
 
 /**
  * SQLite, loaded when a command needs it. Node 22 calls `node:sqlite` experimental and says so when
@@ -43,50 +44,6 @@ export async function pickSnapshot(repo: Repository, wanted?: string): Promise<s
 	if (wanted === undefined || wanted === "latest") return newest;
 	if (!names.includes(wanted)) throw new RepositoryError(`Snapshot ${wanted} is not here.`);
 	return wanted;
-}
-
-export interface TableSummary {
-	name: string;
-	rows: number;
-	/** A virtual table, such as an FTS5 index, whose rows may be rebuilt rather than listed. */
-	virtual: boolean;
-}
-
-export interface DumpSummary {
-	/** Whether every row was read at the same moment. */
-	consistent: boolean;
-	tables: TableSummary[];
-	rows: number;
-}
-
-/** What a dump holds: its tables and how many rows each has. Names and counts, never values. */
-export function summarize(lines: string[]): DumpSummary {
-	const summary: DumpSummary = { consistent: false, tables: [], rows: 0 };
-	const byName = new Map<string, TableSummary>();
-	let ended = false;
-	lines.forEach((text, index) => {
-		if (text.trim() === "") return;
-		let line: { k?: unknown; name?: unknown; t?: unknown; consistent?: unknown };
-		try {
-			line = JSON.parse(text);
-		} catch {
-			throw new DumpError(`Line ${index + 1} of the dump is not a dump line.`);
-		}
-		if (line.k === "head") summary.consistent = line.consistent === true;
-		else if ((line.k === "table" || line.k === "virtual") && typeof line.name === "string") {
-			const table = { name: line.name, rows: 0, virtual: line.k === "virtual" };
-			byName.set(line.name, table);
-			summary.tables.push(table);
-		} else if (line.k === "row" && typeof line.t === "string") {
-			const table = byName.get(line.t);
-			if (!table)
-				throw new DumpError(`Line ${index + 1} has a row for a table the dump hasn't made.`);
-			table.rows++;
-			summary.rows++;
-		} else if (line.k === "end") ended = true;
-	});
-	if (!ended) throw new DumpError("The dump stops before its end: it is incomplete.");
-	return summary;
 }
 
 /** A file's bytes as they come, checked against the manifest's size and SHA-256 at the end. */
@@ -123,7 +80,7 @@ function load(db: DatabaseSync, lines: string[]): void {
 			try {
 				db.exec(statement);
 			} catch (error) {
-				throw new RestoreError(`${describe(statement)} failed: ${sqliteReason(error)}`);
+				throw new RestoreError(`${describeStatement(statement)} failed: ${sqliteReason(error)}`);
 			}
 		}
 		db.exec("COMMIT");
@@ -136,11 +93,6 @@ function load(db: DatabaseSync, lines: string[]): void {
 		if (error instanceof RestoreError || error instanceof DumpError) throw error;
 		throw new RestoreError(`The database didn't load: ${sqliteReason(error)}`);
 	}
-}
-
-/** A statement by what it does and to which object: `INSERT INTO "person"`, never its values. */
-function describe(statement: string): string {
-	return (statement.split(/\s*\(|\s+VALUES\b/i)[0] ?? "").slice(0, 120);
 }
 
 /** SQLite's reason, when it names only tables and columns; its error class otherwise. */
@@ -201,7 +153,7 @@ export async function showSnapshot(
 	const hasDump = manifest.files.some((file) => file.path === DUMP_FILE);
 	return {
 		...infoOf(manifest),
-		database: hasDump ? summarize(await readDump(repo, manifest)) : null,
+		database: hasDump ? summarizeDump(await readDump(repo, manifest)) : null,
 	};
 }
 
@@ -232,7 +184,7 @@ export async function checkSnapshot(repo: Repository, name: string): Promise<Che
 		if (manifest.files.some((file) => file.path === DUMP_FILE)) {
 			const lines = await readDump(repo, manifest);
 			bytes += manifest.files.find((file) => file.path === DUMP_FILE)?.size ?? 0;
-			const summary = summarize(lines);
+			const summary = summarizeDump(lines);
 			const db = await openSqlite(":memory:");
 			try {
 				load(db, lines);
@@ -307,7 +259,7 @@ export async function restoreSnapshot(
 			return { name, as: way, written, database: null };
 		}
 		const lines = await readDump(repo, manifest);
-		const summary = summarize(lines);
+		const summary = summarizeDump(lines);
 		const target = targets[0] ?? "";
 		if (way === "sql") {
 			await writeNew(target, async (file) => {

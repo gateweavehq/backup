@@ -66,10 +66,10 @@ catalog, the lock and retention; the rest of this section is still to come where
   a KV binding per namespace, and an RPC binding (`backup()`) for a Durable Object app that offers
   one. Track, Agents and Mail will offer one first.
 - **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
-  prune, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
+  prune, test when due, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
   `wrangler workflows trigger` starts one by hand.
-- **A D1 catalog** of runs, snapshots and locks (restore tests next) feeds the page, the alerts and
+- **A D1 catalog** of runs, snapshots, locks and restore tests feeds the page, the alerts and
   MCP. It describes the bucket and never replaces it.
 - **A lock per source.** Pruning deletes the chunks no manifest names, so it must never meet a run
   that has found a chunk stored and not yet written its manifest. A run takes the source's lock
@@ -78,6 +78,18 @@ catalog, the lock and retention; the rest of this section is still to come where
 - **Retention:** the newest snapshot, then 7 daily, 4 weekly and 12 monthly by default. Pruning
   forgets manifests first, then deletes the chunks nothing points to. The snapshot a run just made
   always stays.
+- **Restore tests.** A run restores the snapshot it made when the source's last passed test is
+  `RESTORE_TEST_DAYS` old (30 by default) or it has none, so a failed one is tried again the next
+  night. A Durable Object, one per source, reads every file back and checks it, makes the dump's
+  tables in its own SQLite, loads the rows in one transaction, checks foreign keys, counts every
+  table against the dump, and rolls the rows back. It runs after the prune and under the lock, so
+  it also proves the prune kept what the snapshot needs. A failed test fails the run but keeps the
+  backup, and the catalog says why.
+- **A restore test keeps no copy.** Only the empty tables are ever committed, and they are deleted
+  at the end, so the 30 days of point-in-time recovery a Durable Object's storage keeps never hold a
+  row. The rows can't go in with the tables: rolling back writes to an FTS5 table made in the same
+  transaction crashed workerd when we tried it. `JURISDICTION` keeps the objects where the bucket
+  is.
 - **Alerts (next):** a failed or late backup sends mail, opens a Track issue or calls a webhook.
 - **MCP (next):** agents can list and check backups. A restore needs a person.
 
@@ -104,5 +116,9 @@ catalog, the lock and retention; the rest of this section is still to come where
   back. A short, documented format and our own restore CLI keep the promise in principle 1.
 - **JSON lines for SQLite, not SQL text.** A line can't be split by a value with a line break in it,
   and the restore can check what it reads, including that the dump ended.
+- **Restore tests in a Durable Object, not in memory.** A WebAssembly SQLite in the Worker would
+  keep everything in memory, but it isn't the SQLite D1 runs, with D1's limits. A Durable Object's
+  is, so a statement D1 would refuse fails the test too, and rolling the rows back keeps the data out
+  of its storage.
 - **One consistent read where possible.** D1's batch is a transaction, so a dump that fits in one
   batch is a true snapshot. Larger databases will need a paged mode, which says it isn't one.

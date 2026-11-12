@@ -12,6 +12,12 @@
 		{ "binding": "RESTORE_DB", "database_name": "restore", "database_id": "restore" }
 	],
 	"r2_buckets": [{ "binding": "VAULT", "bucket_name": "vault" }],
+	"durable_objects": {
+		"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
+	},
+	"exports": {
+		"RestoreTest": { "type": "durable-object", "storage": "sqlite" }
+	},
 	"workflows": [
 		{
 			"name": "gateweave-backup-test",
@@ -24,6 +30,8 @@
 			{ "name": "app", "kind": "d1", "binding": "SOURCE_DB" },
 			{ "name": "broken", "kind": "d1", "binding": "VAULT" }
 		],
-		"RETENTION": "1l 7d 4w 12m"
+		"RETENTION": "1l 7d 4w 12m",
+		"RESTORE_TEST_DAYS": "30",
+		"JURISDICTION": ""
 	}
 }

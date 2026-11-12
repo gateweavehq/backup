@@ -76,6 +76,24 @@ npx wrangler d1 execute gateweave-backup --remote \
 A run with no `sources` backs up all of them. One that fails says why in the catalog's `error`,
 which names objects and steps, never data.
 
+## Restore tests
+
+Every `RESTORE_TEST_DAYS` days (30 by default), a run restores the snapshot it has just made into a
+Durable Object's SQLite, counts every table against the dump, and rolls the rows back, so no copy
+stays there. The first run of a source tests it, and a test that fails is tried again the next
+night. The deploy makes the Durable Object (`exports` in `wrangler.jsonc`).
+
+Set `JURISDICTION` to the bucket's jurisdiction (`"eu"` or `"fedramp"`), so restore tests run there
+too. To test now, add `"test": true` to a run, and read the outcome in the catalog:
+
+```sh
+npx wrangler workflows trigger gateweave-backup '{"sources":["track"],"test":true}'
+npx wrangler d1 execute gateweave-backup --remote \
+  --command "SELECT source, snapshot, status, row_count, error FROM restore_test ORDER BY tested_at DESC LIMIT 5"
+```
+
+A failed test fails the run, but the backup it tested stays.
+
 ## Retention
 
 `RETENTION` keeps the newest snapshot, the newest of each of the last 7 days, 4 weeks and 12 months
@@ -92,3 +110,5 @@ writes SQL for a new D1 database.
 - One copy, in R2. The copy at another provider comes next.
 - A database is read in one D1 batch, which must fit in one response. Very large databases will need
   a paged mode.
+- A row longer than 100 KB, as SQL, doesn't restore: D1 refuses a statement that long. A snapshot
+  that holds one fails its restore test.

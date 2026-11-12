@@ -114,6 +114,8 @@ export interface S3Options {
 }
 
 const ATTEMPTS = 4;
+/** How long one request may take, its body included, before it is tried again. */
+const TIMEOUT_MS = 120_000;
 
 /**
  * A repository in an S3-compatible bucket, read with path-style requests signed with SigV4. R2
@@ -133,16 +135,22 @@ export class S3Store implements ObjectStore {
 		this.#base = `${options.endpoint.pathname.replace(/\/+$/, "")}/${uriEncode(options.bucket)}`;
 	}
 
-	async #request(
+	/**
+	 * Makes a signed request and reads its answer with `read`, trying again when the bucket is busy
+	 * or the connection fails, the answer's body included. `read` throws a `StoreError` to refuse.
+	 */
+	async #request<T>(
 		method: "GET" | "HEAD",
 		key: string | null,
 		query: [string, string][],
-	): Promise<Response> {
+		read: (response: Response) => Promise<T>,
+	): Promise<T> {
 		const { endpoint, region, credentials } = this.#options;
 		const path =
 			key === null ? `${this.#base}/` : `${this.#base}/${uriEncode(key, { keepSlash: true })}`;
 		const search = query.map(([name, value]) => `${uriEncode(name)}=${uriEncode(value)}`).join("&");
 		const url = `${endpoint.origin}${path}${search ? `?${search}` : ""}`;
+		const what = key ?? "a listing";
 		let last: unknown;
 		for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
 			const amzDate = amzDateOf(this.#options.now?.() ?? new Date());
@@ -164,18 +172,20 @@ export class S3Store implements ObjectStore {
 					method,
 					// `host` is the fetch's own; it is signed, not sent by hand.
 					headers: [...headers.filter(([name]) => name !== "host"), ["authorization", signature]],
+					signal: AbortSignal.timeout(TIMEOUT_MS),
 				});
-				if (response.status < 500 && response.status !== 429) return response;
-				last = new StoreError(`The bucket answered ${response.status} for ${key ?? "a listing"}.`);
+				if (response.status < 500 && response.status !== 429) return await read(response);
+				last = new StoreError(`The bucket answered ${response.status} for ${what}.`);
 				await response.body?.cancel();
 			} catch (error) {
+				if (error instanceof StoreError) throw error;
 				last = error;
 			}
 			if (attempt < ATTEMPTS) await new Promise((done) => setTimeout(done, 250 * 2 ** attempt));
 		}
 		throw last instanceof StoreError
 			? last
-			: new StoreError(`The bucket couldn't be reached for ${key ?? "a listing"}.`);
+			: new StoreError(`The bucket couldn't be reached for ${what}.`);
 	}
 
 	async #refused(response: Response, key: string | null): Promise<never> {
@@ -188,22 +198,24 @@ export class S3Store implements ObjectStore {
 
 	async get(key: string) {
 		checkKey(key);
-		const response = await this.#request("GET", this.#options.prefix + key, []);
-		if (response.status === 404) {
-			await response.body?.cancel();
-			return null;
-		}
-		if (!response.ok) return this.#refused(response, key);
-		return new Uint8Array(await response.arrayBuffer());
+		return this.#request("GET", this.#options.prefix + key, [], async (response) => {
+			if (response.status === 404) {
+				await response.body?.cancel();
+				return null;
+			}
+			if (!response.ok) return this.#refused(response, key);
+			return new Uint8Array(await response.arrayBuffer());
+		});
 	}
 
 	async has(key: string) {
 		checkKey(key);
-		const response = await this.#request("HEAD", this.#options.prefix + key, []);
-		await response.body?.cancel();
-		if (response.status === 404) return false;
-		if (!response.ok) return this.#refused(response, key);
-		return true;
+		return this.#request("HEAD", this.#options.prefix + key, [], async (response) => {
+			await response.body?.cancel();
+			if (response.status === 404) return false;
+			if (!response.ok) return this.#refused(response, key);
+			return true;
+		});
 	}
 
 	async *list(prefix: string) {
@@ -215,9 +227,10 @@ export class S3Store implements ObjectStore {
 				["prefix", full],
 			];
 			if (token !== null) query.push(["continuation-token", token]);
-			const response = await this.#request("GET", null, query);
-			if (!response.ok) await this.#refused(response, null);
-			const page = parseListing(await response.text());
+			const page = await this.#request("GET", null, query, async (response) => {
+				if (!response.ok) return this.#refused(response, null);
+				return parseListing(await response.text());
+			});
 			for (const key of page.keys) {
 				if (key.startsWith(this.#options.prefix)) yield key.slice(this.#options.prefix.length);
 			}
@@ -284,6 +297,15 @@ export function openStore(location: string, settings: Settings): ObjectStore {
 	let prefix = slash < 0 ? "" : rest.slice(slash + 1);
 	if (prefix !== "" && !prefix.endsWith("/")) prefix += "/";
 	if (bucket === "") throw new StoreError("s3:// needs a bucket: s3://<bucket>/<folder>.");
+	// A URL would tidy these away, and the request would no longer be the one signed.
+	if (
+		prefix
+			.split("/")
+			.slice(0, -1)
+			.some((part) => part === "" || part === "." || part === "..")
+	) {
+		throw new StoreError("The folder in an s3:// repository has an empty, . or .. part.");
+	}
 	const endpoint = settings.endpoint ?? settings.env.AWS_ENDPOINT_URL;
 	if (!endpoint) {
 		throw new StoreError(

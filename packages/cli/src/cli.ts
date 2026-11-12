@@ -2,6 +2,7 @@ import { parseArgs } from "node:util";
 import { Repository } from "@gateweave/backup-core";
 import {
 	checkSnapshot,
+	type DamagedSnapshot,
 	listSnapshots,
 	messageOf,
 	pickSnapshot,
@@ -115,7 +116,8 @@ export async function run(argv: string[], io: Io): Promise<number> {
 				if (values.json) io.out(`${JSON.stringify(list, null, "\t")}\n`);
 				else if (list.length === 0) io.out("No snapshots yet.\n");
 				else for (const info of list) io.out(`${line(info)}\n`);
-				return 0;
+				// Listed all the same, but a snapshot that doesn't open is a failure to know of.
+				return list.some((info) => "error" in info) ? 1 : 0;
 			}
 			case "show": {
 				const shown = await showSnapshot(repo, await pickSnapshot(repo, snapshot));
@@ -206,7 +208,8 @@ function parse(argv: string[]) {
 	});
 }
 
-function line(info: SnapshotInfo): string {
+function line(info: SnapshotInfo | DamagedSnapshot): string {
+	if ("error" in info) return `${info.name}  DAMAGED: ${info.error}`;
 	const rows = typeof info.meta.rows === "number" ? `, ${info.meta.rows} rows` : "";
 	return `${info.name}  ${info.created}  ${info.source.kind} ${info.source.name}  ${bytes(info.size)}${rows}`;
 }

@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,6 +25,7 @@ import {
 } from "@gateweave/backup-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { HELP, type Io, run } from "../src/cli";
+import { authorization, EMPTY_SHA256 } from "../src/sigv4";
 import { FolderStore, parseListing, StoreError } from "../src/stores";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -79,6 +88,20 @@ function writeOut(objects: MemoryStore, dir: string) {
 	}
 }
 
+/** A repository with small chunks, so a dump of a few hundred rows takes many of them. */
+async function bigRepository() {
+	const big = new MemoryStore();
+	const repo = await Repository.init(big, KEY, { chunker: { min: 256, avg: 1024, max: 4096 } });
+	const db = new DatabaseSync(":memory:");
+	db.exec("CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT)");
+	const insert = db.prepare("INSERT INTO note (body) VALUES (?)");
+	for (let n = 0; n < 400; n++) insert.run(`${n}`.padEnd(300, String.fromCharCode(97 + (n % 26))));
+	await snapshotOf(repo, db, "2026-11-12T03:17:00Z");
+	const dir = join(temp, `big-${crypto.randomUUID()}`);
+	writeOut(big, dir);
+	return { store: big, dir };
+}
+
 interface Ran {
 	code: number;
 	out: string;
@@ -129,6 +152,19 @@ describe("snapshots and show", () => {
 
 		const json = JSON.parse((await cli(["snapshots", repoDir, "--json"])).out);
 		expect(json.map((s: { name: string }) => s.name)).toEqual([first, second]);
+	});
+
+	it("lists a snapshot that doesn't open as damaged, and the others all the same", async () => {
+		const damaged = join(temp, "damaged-manifest");
+		writeOut(store, damaged);
+		const path = join(damaged, "snapshots", first);
+		const bytes = readFileSync(path);
+		bytes[bytes.length - 1] = (bytes[bytes.length - 1] ?? 0) ^ 1;
+		writeFileSync(path, bytes);
+		const ran = await cli(["snapshots", damaged]);
+		expect(ran.code).toBe(1);
+		expect(ran.out).toContain(`${first}  DAMAGED: `);
+		expect(ran.out).toContain(second);
 	});
 
 	it("previews the newest snapshot's tables and rows, never their values", async () => {
@@ -204,14 +240,18 @@ describe("restore", () => {
 		db.close();
 	});
 
-	it("writes SQL that loads into an empty database, as D1 takes it", async () => {
+	it("writes SQL that loads into an empty database as one file", async () => {
 		const to = join(temp, "as-sql");
 		const ran = await cli(["restore", repoDir, first, "--to", to]);
 		expect(ran.code).toBe(0);
 		expect(ran.out).toContain("wrangler d1 execute");
+		const sql = readFileSync(join(to, "database.sql"), "utf8");
+		// D1 runs a file without BEGIN or COMMIT, which it refuses.
+		expect(sql).not.toMatch(/^(BEGIN|COMMIT)/m);
 		const db = new DatabaseSync(":memory:");
-		db.exec(`BEGIN;\n${readFileSync(join(to, "database.sql"), "utf8")}\nCOMMIT;`);
+		db.exec(sql);
 		expect(rows(db)).toEqual(rows(sample()));
+		expect(readdirSync(to)).toEqual(["database.sql"]);
 	});
 
 	it("writes the files as they were backed up", async () => {
@@ -233,6 +273,61 @@ describe("restore", () => {
 		expect(ran.code).toBe(1);
 		expect(ran.err).toContain("is there already");
 		expect(readFileSync(join(to, "database.sql"), "utf8")).toBe("keep me");
+	});
+
+	it("never writes over a file that is there, restoring the files either", async () => {
+		const to = join(temp, "taken-files");
+		mkdirSync(to, { recursive: true });
+		writeFileSync(join(to, "database.jsonl"), "keep me");
+		const ran = await cli(["restore", repoDir, "--to", to, "--as", "files"]);
+		expect(ran.code).toBe(1);
+		expect(readFileSync(join(to, "database.jsonl"), "utf8")).toBe("keep me");
+		expect(readdirSync(to)).toEqual(["database.jsonl"]);
+	});
+
+	it("leaves nothing behind when a chunk turns out damaged half way", async () => {
+		const big = await bigRepository();
+		const chunk = [...big.store.objects.keys()].filter((key) => key.startsWith("data/")).sort()[1];
+		if (!chunk) throw new Error("Expected several chunks.");
+		const path = join(big.dir, ...chunk.split("/"));
+		const bytes = readFileSync(path);
+		bytes[20] = (bytes[20] ?? 0) ^ 1;
+		writeFileSync(path, bytes);
+		for (const as of ["files", "sql", "sqlite"]) {
+			const to = join(temp, `damaged-${as}`);
+			const ran = await cli(["restore", big.dir, "--to", to, "--as", as]);
+			expect(ran.code).toBe(1);
+			expect(ran.err).toContain("could not be opened");
+			expect(readdirSync(to)).toEqual([]);
+		}
+	});
+
+	it("restores a database cut into many chunks", async () => {
+		const big = await bigRepository();
+		const chunks = [...big.store.objects.keys()].filter((key) => key.startsWith("data/"));
+		expect(chunks.length).toBeGreaterThan(3);
+		const to = join(temp, "many-chunks");
+		expect((await cli(["restore", big.dir, "--to", to, "--as", "sqlite"])).code).toBe(0);
+		const db = new DatabaseSync(join(to, "database.sqlite"));
+		expect(db.prepare("SELECT count(*) AS n, sum(length(body)) AS bytes FROM note").get()).toEqual({
+			n: 400,
+			bytes: 400 * 300,
+		});
+		db.close();
+	});
+
+	it("refuses a file the snapshot names outside the folder", async () => {
+		const odd = new MemoryStore();
+		const repo = await Repository.init(odd, KEY);
+		const { entry } = await repo.writeFile("x", utf8("outside"));
+		await repo.commit({ kind: "files", name: "odd" }, [{ ...entry, path: "../escaped.txt" }]);
+		const dir = join(temp, "odd-repo");
+		writeOut(odd, dir);
+		const to = join(temp, "odd-out");
+		const ran = await cli(["restore", dir, "--to", to]);
+		expect(ran.code).toBe(1);
+		expect(ran.err).toContain("can't write");
+		expect(existsSync(join(temp, "escaped.txt"))).toBe(false);
 	});
 
 	it("restores the repository the format's first version wrote", async () => {
@@ -259,6 +354,15 @@ describe("the key", () => {
 		expect(ran.out + ran.err).not.toContain(KEY);
 	});
 
+	it("comes from a file PowerShell wrote, in UTF-16", async () => {
+		const file = join(temp, "key-utf16.txt");
+		const text = Buffer.from(`${KEY}\r\n`, "utf16le");
+		writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), text]));
+		const ran = await cli(["snapshots", repoDir, "--key-file", file], { env: {} });
+		expect(ran.err).toBe("");
+		expect(ran.code).toBe(0);
+	});
+
 	it("is asked for when nothing gives it", async () => {
 		const ran = await cli(["snapshots", repoDir], { env: {}, ask: async () => KEY });
 		expect(ran.code).toBe(0);
@@ -276,6 +380,8 @@ describe("an S3-compatible bucket", () => {
 	let endpoint: string;
 	const methods = new Set<string>();
 	const authorizations: string[] = [];
+	const ODD = "odd folder+~é";
+	let busyOnce = false;
 
 	beforeAll(async () => {
 		// The repository sits in a folder of the bucket, as the Worker keeps one per source.
@@ -283,9 +389,38 @@ describe("an S3-compatible bucket", () => {
 			[...store.objects].map(([key, value]) => [`track/${key}`, value] as const),
 		);
 		objects.set("other/config.json", utf8("{}"));
+		// A folder whose name needs escaping, and one that is busy once.
+		for (const folder of [ODD, "flaky"]) {
+			for (const [key, value] of store.objects) objects.set(`${folder}/${key}`, value);
+		}
 		server = createServer((request, response) => {
 			methods.add(request.method ?? "");
 			authorizations.push(request.headers.authorization ?? "");
+			// Signed again here from what arrived, so a path or query sent unlike it was signed fails,
+			// as R2 would refuse it.
+			const [rawPath = "/", rawQuery = ""] = (request.url ?? "/").split("?");
+			const amzDate = String(request.headers["x-amz-date"] ?? "");
+			const expected = authorization(
+				{
+					method: request.method ?? "",
+					path: rawPath,
+					query: [...new URLSearchParams(rawQuery)],
+					headers: [
+						["host", String(request.headers.host)],
+						["x-amz-content-sha256", String(request.headers["x-amz-content-sha256"])],
+						["x-amz-date", amzDate],
+					],
+					payloadHash: EMPTY_SHA256,
+				},
+				{ accessKeyId: "test-access-key", secretAccessKey: "test-secret" },
+				"auto",
+				amzDate,
+			);
+			if (request.headers.authorization !== expected) {
+				response.statusCode = 403;
+				response.end("<Error><Code>SignatureDoesNotMatch</Code></Error>");
+				return;
+			}
 			const url = new URL(request.url ?? "/", "http://bucket");
 			if (url.pathname === "/vault/" && url.searchParams.get("list-type") === "2") {
 				// Two keys a page, so the CLI has to follow continuation tokens.
@@ -304,7 +439,13 @@ describe("an S3-compatible bucket", () => {
 				);
 				return;
 			}
-			const key = decodeURIComponent(url.pathname.replace(/^\/vault\//, ""));
+			const key = decodeURIComponent(rawPath.replace(/^\/vault\//, ""));
+			if (key === "flaky/config.json" && !busyOnce) {
+				busyOnce = true;
+				response.statusCode = 503;
+				response.end("<Error><Code>SlowDown</Code></Error>");
+				return;
+			}
 			const value = objects.get(key);
 			if (!value) {
 				response.statusCode = 404;
@@ -346,6 +487,24 @@ describe("an S3-compatible bucket", () => {
 				),
 			),
 		).toBe(true);
+	});
+
+	it("signs a folder whose name needs escaping as it sends it", async () => {
+		const ran = await cli(["show", `s3://vault/${ODD}`], { env: env() });
+		expect(ran.err).toBe("");
+		expect(ran.out).toContain(second);
+	});
+
+	it("tries again when the bucket is busy", async () => {
+		const ran = await cli(["snapshots", "s3://vault/flaky"], { env: env() });
+		expect(ran.code).toBe(0);
+		expect(busyOnce).toBe(true);
+	});
+
+	it("refuses a folder with a part a URL would tidy away", async () => {
+		const ran = await cli(["snapshots", "s3://vault/track/../other"], { env: env() });
+		expect(ran.code).toBe(1);
+		expect(ran.err).toContain(".. part");
 	});
 
 	it("lists every snapshot across pages", async () => {

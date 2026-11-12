@@ -19,17 +19,35 @@ export interface KeySources {
  */
 export async function readMasterKey(sources: KeySources): Promise<string> {
 	if (sources.keyFile !== undefined) {
+		let bytes: Buffer;
 		try {
-			return firstLine(await readFile(sources.keyFile, "utf8"));
+			bytes = await readFile(sources.keyFile);
 		} catch {
 			throw new UsageError(`The key file ${sources.keyFile} can't be read.`);
 		}
+		return firstLine(textOf(bytes));
 	}
 	const fromEnv = sources.env.GATEWEAVE_BACKUP_KEY;
 	if (fromEnv) return firstLine(fromEnv);
 	if (sources.ask) return firstLine(await sources.ask());
 	if (sources.piped) return firstLine(await sources.piped());
 	throw new UsageError("No key: set GATEWEAVE_BACKUP_KEY, or pass --key-file <file>.");
+}
+
+/**
+ * A key file's text. Windows PowerShell's `>` writes UTF-16 with a byte-order mark, and some
+ * editors put one before UTF-8; both are read as the key they hold.
+ */
+function textOf(bytes: Buffer): string {
+	if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString("utf16le");
+	if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+		const even = bytes.subarray(2, 2 + ((bytes.length - 2) & ~1));
+		return Buffer.from(even).swap16().toString("utf16le");
+	}
+	if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+		return bytes.subarray(3).toString("utf8");
+	}
+	return bytes.toString("utf8");
 }
 
 function firstLine(text: string): string {

@@ -100,3 +100,8 @@ The CLI says what went wrong and names the object, never what is in it:
   or changed. Try an older snapshot; `check --all` shows which ones are whole.
 - **… is missing**: a chunk is gone, so its snapshot can't be restored whole.
 - **… is there already**: the folder has a file of that name. Pick an empty folder.
+
+A file is written as `<name>.partial-<random>` and gets its name only once it is whole. If the CLI
+is killed outright, such a file can stay behind: delete it and restore again.
+
+`--key-file` reads a file PowerShell's `>` wrote (UTF-16) as well as plain text.

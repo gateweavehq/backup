@@ -19,17 +19,21 @@ export const HELP = `gateweave-backup: read and restore Gateweave Backup reposit
 Usage:
   gateweave-backup snapshots <repository>
       List the snapshots, oldest first.
-  gateweave-backup show <repository> [snapshot]
-      What a snapshot holds: its files and, for a database, its tables and rows.
+  gateweave-backup show <repository> [snapshot] [--object <name>]
+      What a snapshot holds: its files and, for a database, its tables and rows. A snapshot of
+      an app's Durable Objects lists them; --object shows one's tables.
   gateweave-backup check <repository> [snapshot] [--all]
-      Read a snapshot as a restore would, and restore its database into memory to count it.
-      --all checks every snapshot.
+      Read a snapshot as a restore would, and restore each database in it into memory to count
+      it. --all checks every snapshot.
   gateweave-backup restore <repository> [snapshot] --to <folder> [--as sql|sqlite|files]
+                           [--object <name>]
       Write a snapshot out to a folder. It writes only new files, never over anything.
       sql (the default for a database): database.sql, to load into a new D1 database with
         npx wrangler d1 execute <new database> --remote --file database.sql
       sqlite: database.sqlite, a SQLite database file.
       files: the files the snapshot holds, as they were backed up.
+      A snapshot of an app's Durable Objects gives <object>.sql or <object>.sqlite for each
+      object, or only for the one --object names.
 
 <repository> is a folder holding a copy of one (config.json, snapshots/, data/), or
 s3://<bucket>/<folder> for one in R2 or another S3-compatible bucket, such as
@@ -90,6 +94,9 @@ export async function run(argv: string[], io: Io): Promise<number> {
 		if (command === "check" && values.all && snapshot !== undefined) {
 			throw new UsageError("check takes a snapshot or --all, not both.");
 		}
+		if (values.object !== undefined && command !== "show" && command !== "restore") {
+			throw new UsageError("--object is for show and restore.");
+		}
 		if (command === "restore" && values.to === undefined) {
 			throw new UsageError("restore needs --to <folder>, a folder to write the snapshot to.");
 		}
@@ -120,7 +127,7 @@ export async function run(argv: string[], io: Io): Promise<number> {
 				return list.some((info) => "error" in info) ? 1 : 0;
 			}
 			case "show": {
-				const shown = await showSnapshot(repo, await pickSnapshot(repo, snapshot));
+				const shown = await showSnapshot(repo, await pickSnapshot(repo, snapshot), values.object);
 				if (values.json) {
 					io.out(`${JSON.stringify(shown, null, "\t")}\n`);
 					return 0;
@@ -129,6 +136,10 @@ export async function run(argv: string[], io: Io): Promise<number> {
 				io.out(`Source    ${shown.source.kind} ${shown.source.name}\n`);
 				io.out(`Made      ${shown.created}\n`);
 				for (const file of shown.files) io.out(`File      ${file.path}, ${bytes(file.size)}\n`);
+				if (shown.objects && shown.object === null) {
+					io.out(`Objects   ${shown.objects.length}, a database each; --object <name> shows one\n`);
+				}
+				if (shown.object !== null) io.out(`Object    ${shown.object}\n`);
 				const db = shown.database;
 				if (db) {
 					io.out(
@@ -150,9 +161,13 @@ export async function run(argv: string[], io: Io): Promise<number> {
 					results.push(result);
 					if (values.json) continue;
 					if (result.ok) {
+						const objects =
+							result.objects !== undefined
+								? ` ${result.objects} ${result.objects === 1 ? "object" : "objects"}:`
+								: "";
 						const restored =
 							result.tables !== undefined
-								? `, restored ${result.tables} tables and ${result.rows} rows`
+								? `, restored${objects} ${result.tables} tables and ${result.rows} rows`
 								: "";
 						io.out(`ok      ${name}: read ${bytes(result.bytes)}${restored}\n`);
 					} else io.out(`FAILED  ${name}: ${result.error}\n`);
@@ -165,14 +180,23 @@ export async function run(argv: string[], io: Io): Promise<number> {
 				const report = await restoreSnapshot(repo, name, {
 					to: values.to ?? "",
 					...(as !== undefined ? { as: as as RestoreAs } : {}),
+					...(values.object !== undefined ? { object: values.object } : {}),
 				});
 				for (const path of report.written) io.out(`Wrote ${path}\n`);
-				if (report.database) {
+				const tables = report.databases.reduce((sum, d) => sum + d.summary.tables.length, 0);
+				const rows = report.databases.reduce((sum, d) => sum + d.summary.rows, 0);
+				if (report.objects && report.as !== "files") {
+					const count = report.databases.length;
 					io.out(
-						`Snapshot ${name}: ${report.database.tables.length} tables, ${report.database.rows} rows.\n`,
+						`Snapshot ${name}: ${count} ${count === 1 ? "object" : "objects"}, ${tables} tables, ${rows} rows.\n`,
 					);
+					io.out(
+						"Each file is one object's database, to read in SQLite or load into a new D1 database, never into the live app.\n",
+					);
+				} else if (report.databases.length > 0) {
+					io.out(`Snapshot ${name}: ${tables} tables, ${rows} rows.\n`);
 				}
-				if (report.as === "sql") {
+				if (report.as === "sql" && !report.objects) {
 					io.out(
 						"Load it into a new D1 database, never the live one:\n  npx wrangler d1 create <new database>\n  npx wrangler d1 execute <new database> --remote --file database.sql\n",
 					);
@@ -198,6 +222,7 @@ function parse(argv: string[]) {
 		options: {
 			to: { type: "string" },
 			as: { type: "string" },
+			object: { type: "string" },
 			all: { type: "boolean" },
 			json: { type: "boolean" },
 			"key-file": { type: "string" },

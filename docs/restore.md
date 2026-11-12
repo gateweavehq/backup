@@ -69,7 +69,8 @@ node gateweave-backup.mjs show s3://gateweave-backup/track latest
 names and counts, never values.
 
 `check` reads a snapshot the way a restore would, checks every chunk against its id and every file
-against its SHA-256, then restores the database into memory and counts its rows against the dump.
+against its SHA-256, then restores each database in it into memory and counts its rows against the
+dump.
 `check --all` does that for every snapshot. Nothing is written to disk.
 
 ```sh
@@ -90,6 +91,20 @@ file into the live database: it makes every table, and the live one has them alr
 `--as sqlite` writes `database.sqlite` instead, a SQLite file to open with `sqlite3` or any SQLite
 tool. `--as files` writes the files the snapshot holds, as they were backed up (`database.jsonl`,
 [format.md](format.md#sqlite-dumps) describes it).
+
+## Restore an app's Durable Objects
+
+A snapshot of an app's Durable Objects, such as Track's workspaces, holds a database per object.
+`show` lists them, and `--object <name>` shows one's tables. `restore` writes `<object>.sql` for each
+object, or `<object>.sqlite` with `--as sqlite`; `--object` restores only the one it names:
+
+```sh
+node gateweave-backup.mjs show s3://gateweave-backup/track-workspaces latest
+node gateweave-backup.mjs restore s3://gateweave-backup/track-workspaces latest --to ./restore --as sqlite --object <workspace id>
+```
+
+Each file is one object's database. Read it with `sqlite3`, or load the SQL into a new D1 database
+to look at it. Putting it back into the live app's object is the app's to offer; Track doesn't yet.
 
 ## When it fails
 

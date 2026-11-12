@@ -132,6 +132,9 @@ rest of this section is still to come where it says so.
   finished.
 - **Checks by restoring.** `check` restores each database into memory and counts its rows against
   the dump, which proves more than reading the bytes.
+- **An object at a time.** A snapshot of an app's Durable Objects restores to a file per object,
+  `<object>.sql` or `<object>.sqlite`, or to the one `--object` names, since one workspace is what
+  someone usually needs back.
 
 ## Decisions
 

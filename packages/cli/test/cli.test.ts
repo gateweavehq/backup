@@ -19,6 +19,7 @@ import {
 	generateMasterKey,
 	joinLines,
 	MemoryStore,
+	objectFile,
 	Repository,
 	type Row,
 	utf8,
@@ -342,6 +343,138 @@ describe("restore", () => {
 			{ id: 2, email: "grace@example.com" },
 		]);
 		db.close();
+	});
+});
+
+/** A small database, as one of an app's Durable Objects might hold. */
+function small(): DatabaseSync {
+	const db = new DatabaseSync(":memory:");
+	db.exec(`
+		CREATE TABLE issue (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+		INSERT INTO issue VALUES ('i1', 'Kept'), ('i2', 'Also kept');
+	`);
+	return db;
+}
+
+/** A repository with one snapshot of an app's objects: ws-a holds sample(), ws-b small(). */
+async function objectsRepository() {
+	const objects = new MemoryStore();
+	const repo = await Repository.init(objects, KEY);
+	const entries = [];
+	let tables = 0;
+	let rowCount = 0;
+	for (const [name, db] of [
+		["ws-a", sample()],
+		["ws-b", small()],
+	] as const) {
+		const dump = await dumpSqlite({
+			async readTogether(statements) {
+				return statements.map((sql) => db.prepare(sql).all() as Row[]);
+			},
+		});
+		const { entry } = await repo.writeFile(objectFile(name), utf8(joinLines(dump.lines)));
+		entries.push(entry);
+		tables += dump.stats.tables;
+		rowCount += dump.stats.rows;
+	}
+	const meta = { objects: 2, tables, rows: rowCount, empty: [] };
+	const manifest = await repo.commit({ kind: "do", name: "track-workspaces" }, entries, meta);
+	const dir = join(temp, `objects-${crypto.randomUUID()}`);
+	writeOut(objects, dir);
+	return { store: objects, dir, name: manifest.name, rows: rowCount };
+}
+
+describe("a snapshot of an app's Durable Objects", () => {
+	it("lists its objects, and shows one's tables", async () => {
+		const { dir } = await objectsRepository();
+		const ran = await cli(["show", dir]);
+		expect(ran.code).toBe(0);
+		expect(ran.out).toContain("Source    do track-workspaces");
+		expect(ran.out).toContain("File      objects/ws-a.jsonl");
+		expect(ran.out).toContain("Objects   2, a database each; --object <name> shows one");
+		expect(ran.out).not.toContain("Database");
+
+		const one = await cli(["show", dir, "--object", "ws-b"]);
+		expect(one.code).toBe(0);
+		expect(one.out).toContain("Object    ws-b");
+		expect(one.out).toMatch(/Database {2}1 tables, 2 rows/);
+		expect(one.out).toMatch(/issue\s+2/);
+		expect(one.out).not.toContain("Kept");
+
+		const json = JSON.parse((await cli(["show", dir, "--json"])).out);
+		expect(json.objects).toEqual(["ws-a", "ws-b"]);
+
+		const missing = await cli(["show", dir, "--object", "ws-c"]);
+		expect(missing.code).toBe(1);
+		expect(missing.err).toContain("holds no object ws-c.");
+	});
+
+	it("checks every object's database by restoring it into memory", async () => {
+		const { dir, rows: rowCount } = await objectsRepository();
+		const ran = await cli(["check", dir]);
+		expect(ran.code).toBe(0);
+		expect(ran.out).toMatch(
+			new RegExp(`^ok {6}\\S+: read .+, restored 2 objects: 5 tables and ${rowCount} rows$`, "m"),
+		);
+	});
+
+	it("names the object whose database doesn't come back", async () => {
+		const { store: objects, dir } = await objectsRepository();
+		const repo = await Repository.open(new FolderStore(dir), KEY);
+		const [name] = await repo.snapshots();
+		const manifest = await repo.manifest(name ?? "");
+		const chunk = manifest.files.find((entry) => entry.path === "objects/ws-b.jsonl")?.chunks[0];
+		if (!chunk) throw new Error("No chunk.");
+		const key = `data/${chunk.slice(0, 2)}/${chunk}`;
+		expect(objects.objects.has(key)).toBe(true);
+		const path = join(dir, ...key.split("/"));
+		const bytes = readFileSync(path);
+		bytes[bytes.length - 1] = (bytes[bytes.length - 1] ?? 0) ^ 1;
+		writeFileSync(path, bytes);
+
+		const ran = await cli(["check", dir]);
+		expect(ran.code).toBe(1);
+		expect(ran.out).toMatch(/^FAILED {2}\S+: ws-b: /m);
+	});
+
+	it("restores each object as its own SQL file, or one as SQLite", async () => {
+		const { dir } = await objectsRepository();
+		const to = join(temp, `objects-sql-${crypto.randomUUID()}`);
+		const ran = await cli(["restore", dir, "--to", to]);
+		expect(ran.code).toBe(0);
+		expect(ran.out).toContain("2 objects, 5 tables");
+		expect(ran.out).not.toContain("wrangler d1 execute");
+		expect(readdirSync(to).sort()).toEqual(["ws-a.sql", "ws-b.sql"]);
+		const db = new DatabaseSync(":memory:");
+		db.exec(readFileSync(join(to, "ws-b.sql"), "utf8"));
+		expect(db.prepare("SELECT id, title FROM issue ORDER BY id").all()).toEqual(
+			small().prepare("SELECT id, title FROM issue ORDER BY id").all(),
+		);
+
+		const one = join(temp, `objects-sqlite-${crypto.randomUUID()}`);
+		const single = await cli(["restore", dir, "--to", one, "--as", "sqlite", "--object", "ws-a"]);
+		expect(single.code).toBe(0);
+		expect(single.out).toContain("1 object, 4 tables");
+		expect(readdirSync(one)).toEqual(["ws-a.sqlite"]);
+		const restored = new DatabaseSync(join(one, "ws-a.sqlite"));
+		expect(restored.prepare("SELECT name FROM team ORDER BY id").all()).toEqual(
+			sample().prepare("SELECT name FROM team ORDER BY id").all(),
+		);
+		restored.close();
+
+		const files = join(temp, `objects-files-${crypto.randomUUID()}`);
+		expect((await cli(["restore", dir, "--to", files, "--as", "files"])).code).toBe(0);
+		expect(readdirSync(join(files, "objects")).sort()).toEqual(["ws-a.jsonl", "ws-b.jsonl"]);
+	});
+
+	it("takes --object only for a snapshot of objects, and only to show or restore", async () => {
+		const wrong = await cli(["show", repoDir, "--object", "ws-a"]);
+		expect(wrong.code).toBe(1);
+		expect(wrong.err).toContain("is of one database, not of objects: leave out --object.");
+
+		const check = await cli(["check", repoDir, "--object", "ws-a"]);
+		expect(check.code).toBe(2);
+		expect(check.err).toContain("--object is for show and restore.");
 	});
 });
 

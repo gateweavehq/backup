@@ -61,6 +61,7 @@ beforeEach(async () => {
 	]);
 	const listed = await env.VAULT.list();
 	if (listed.objects.length > 0) await env.VAULT.delete(listed.objects.map((o) => o.key));
+	await env.APP_SEED.clear();
 	await env.SOURCE_DB.batch([
 		env.SOURCE_DB.prepare(
 			"CREATE TABLE person (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, note TEXT, big INTEGER, avatar BLOB)",
@@ -99,10 +100,14 @@ async function repository(source = "app") {
 	return Repository.open(new R2Store(env.VAULT, `${source}/`), env.BACKUP_KEY);
 }
 
-/** Restores the snapshot into RESTORE_DB, as one batch, which rolls back if any of it fails. */
-async function restore(repo: Repository, name: string) {
-	const [file] = (await repo.manifest(name)).files;
-	if (!file) throw new Error("The snapshot has no file.");
+/**
+ * Restores the snapshot's dump, or the one at `path`, into RESTORE_DB, as one batch, which rolls
+ * back if any of it fails.
+ */
+async function restore(repo: Repository, name: string, path?: string) {
+	const { files } = await repo.manifest(name);
+	const file = path === undefined ? files[0] : files.find((entry) => entry.path === path);
+	if (!file) throw new Error("The snapshot has no such file.");
 	const lines = splitLines(fromUtf8(await repo.readWholeFile(file)));
 	const statements = [...restoreSql(lines)];
 	await env.RESTORE_DB.batch(statements.map((sql) => env.RESTORE_DB.prepare(sql)));
@@ -262,11 +267,13 @@ describe("a backup run", () => {
 			"The backup of broken failed.",
 			expect.stringMatching(/^Backup run · \d{1,2} [A-Z][a-z]{2} \d{4}, \d\d:\d\d UTC$/),
 			"",
-			"app      Backed up",
-			expect.stringMatching(/^ {9}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
-			"broken   Failed",
-			"         The backup failed. The snapshots made before it stay.",
-			"         Source broken's binding VAULT isn't a D1 database.",
+			"app       Backed up",
+			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			"broken    Failed",
+			"          The backup failed. The snapshots made before it stay.",
+			"          Source broken's binding VAULT isn't a D1 database.",
+			"objects   Backed up",
+			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
 			"",
 			"The catalog's run and restore_test tables have the details, under this run's id:",
 			"  all",
@@ -330,6 +337,142 @@ describe("a backup run", () => {
 });
 
 /** A schema with what a restore must get right: foreign keys, AUTOINCREMENT, FTS5 and a trigger. */
+const NOTES = [
+	"CREATE TABLE note (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+	"CREATE TABLE tag (note INTEGER NOT NULL REFERENCES note (id), name TEXT NOT NULL)",
+];
+const NOTES_QUERY = "SELECT id, body FROM note ORDER BY id";
+
+/** Three objects in the stand-in app: more than a page of its list. */
+async function addObjects() {
+	await env.APP_SEED.add("alpha", [
+		...NOTES,
+		"INSERT INTO note VALUES (1, 'first'), (2, 'it''s second')",
+		"INSERT INTO tag VALUES (1, 'a')",
+	]);
+	await env.APP_SEED.add("beta", [...NOTES, "INSERT INTO note VALUES (1, 'only')"]);
+	await env.APP_SEED.add("gamma.v2", NOTES);
+}
+
+describe("an app's Durable Objects", () => {
+	it("go into one snapshot, a dump each, and each restores to the same rows", async () => {
+		await addObjects();
+		const result = await backUp("dos", { sources: ["objects"] });
+		expect(result).toEqual({
+			ended: "complete",
+			output: [
+				{
+					source: "objects",
+					status: "ok",
+					snapshot: expect.stringMatching(/^\d{8}T/),
+					test: "passed",
+				},
+			],
+		});
+
+		const repo = await repository("objects");
+		const [name] = await repo.snapshots();
+		if (!name) throw new Error("No snapshot was made.");
+		const manifest = await repo.manifest(name);
+		expect(manifest.source).toEqual({ kind: "do", name: "objects" });
+		expect(manifest.files.map((entry) => entry.path)).toEqual([
+			"objects/alpha.jsonl",
+			"objects/beta.jsonl",
+			"objects/gamma.v2.jsonl",
+		]);
+		expect(manifest.meta).toEqual({
+			objects: 3,
+			tables: 6,
+			rows: 4,
+			empty: [],
+		});
+
+		await restore(repo, name, "objects/alpha.jsonl");
+		expect((await env.RESTORE_DB.prepare(NOTES_QUERY).all()).results).toEqual([
+			{ id: 1, body: "first" },
+			{ id: 2, body: "it's second" },
+		]);
+		await clear(env.RESTORE_DB);
+		await restore(repo, name, "objects/beta.jsonl");
+		expect((await env.RESTORE_DB.prepare(NOTES_QUERY).all()).results).toEqual([
+			{ id: 1, body: "only" },
+		]);
+
+		expect(await runs()).toEqual([
+			expect.objectContaining({
+				id: "dos/objects",
+				status: "ok",
+				snapshot: name,
+				table_count: 6,
+				row_count: 4,
+				error: null,
+			}),
+		]);
+		expect(await tests()).toEqual([
+			expect.objectContaining({
+				run: "dos/objects",
+				status: "passed",
+				table_count: 6,
+				row_count: 4,
+				error: null,
+			}),
+		]);
+		expect(await testerTables("objects")).toEqual([]);
+	});
+
+	it("write only what changed since the last snapshot", async () => {
+		await addObjects();
+		await backUp("before", { sources: ["objects"] });
+		await env.APP_SEED.add("beta", [...NOTES, "INSERT INTO note VALUES (1, 'changed')"]);
+		await backUp("after", { sources: ["objects"] });
+
+		const [before, after] = await runs();
+		expect(Number(before?.new_bytes)).toBeGreaterThan(0);
+		// Only beta's dump is new, and it is smaller than all three.
+		expect(Number(after?.new_bytes)).toBeGreaterThan(0);
+		expect(Number(after?.new_bytes)).toBeLessThan(Number(before?.new_bytes));
+		const repo = await repository("objects");
+		const [name] = await repo.snapshots();
+		await restore(repo, name ?? "", "objects/beta.jsonl");
+		expect((await env.RESTORE_DB.prepare(NOTES_QUERY).all()).results).toEqual([
+			{ id: 1, body: "changed" },
+		]);
+	});
+
+	it("leave out one deleted after the list was made, however many steps they take", async () => {
+		await addObjects();
+		// 21 names take two steps; all but the first and the last are gone by the time they're read.
+		const listed = ["alpha", ...Array.from({ length: 19 }, (_, i) => `gone-${i}`), "beta"];
+		const result = await backUp("deleted", { sources: ["objects"] }, (m) =>
+			m.mockStepResult({ name: "objects: list" }, listed),
+		);
+		expect(result).toMatchObject({ ended: "complete", output: [{ status: "ok", test: "passed" }] });
+
+		const repo = await repository("objects");
+		const [name] = await repo.snapshots();
+		const manifest = await repo.manifest(name ?? "");
+		expect(manifest.files.map((entry) => entry.path)).toEqual([
+			"objects/alpha.jsonl",
+			"objects/beta.jsonl",
+		]);
+		expect(manifest.meta).toMatchObject({ objects: 2, rows: 4 });
+	});
+
+	it("fail at once when the app lists a name no file can have", async () => {
+		const result = await backUp("bad-name", { sources: ["objects"] }, (m) =>
+			m.mockStepResult({ name: "objects: list" }, ["../up"]),
+		);
+		expect(result.ended).toBe("errored");
+		expect(await runs()).toEqual([
+			expect.objectContaining({
+				status: "failed",
+				error: "objects listed an object whose name can't be a file.",
+			}),
+		]);
+		expect(await (await repository("objects")).snapshots()).toEqual([]);
+	});
+});
+
 async function addTeams() {
 	await env.SOURCE_DB.batch(
 		[
@@ -726,6 +869,7 @@ describe("alerts", () => {
 		]);
 
 		await startedRun("broken", HOUR, "ok");
+		await startedRun("objects", HOUR, "ok");
 		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 1 });
 		expect(await alerts()).toEqual([
 			expect.objectContaining({ key: "run:unsent", sent_to: "", error: null }),
@@ -735,6 +879,7 @@ describe("alerts", () => {
 	it("say when a nightly backup didn't start, or didn't end", async () => {
 		await startedRun("app", 30 * HOUR, "ok");
 		await startedRun("broken", 6 * HOUR, "running");
+		await startedRun("objects", 2 * HOUR, "ok");
 		const controller = createScheduledController({ scheduledTime: Date.now(), cron: "17 9 * * *" });
 		await worker.scheduled(controller, env);
 
@@ -750,10 +895,12 @@ describe("alerts", () => {
 			"The backups of app and broken are late.",
 			expect.stringMatching(new RegExp(`^Daily check · ${time}$`)),
 			"",
-			"app      Late",
-			expect.stringMatching(new RegExp(`^ {9}No backup has started since ${time}\\.$`)),
-			"broken   Stuck",
-			expect.stringMatching(new RegExp(`^ {9}The backup that started ${time} hasn't ended\\.$`)),
+			"app       Late",
+			expect.stringMatching(new RegExp(`^ {10}No backup has started since ${time}\\.$`)),
+			"broken    Stuck",
+			expect.stringMatching(new RegExp(`^ {10}The backup that started ${time} hasn't ended\\.$`)),
+			"objects   On time",
+			expect.stringMatching(new RegExp(`^ {10}Last started ${time}\\.$`)),
 			"",
 			"The nightly run didn't start, or stopped part way. The Workflow's instances say which:",
 			"  npx wrangler workflows instances list gateweave-backup",
@@ -809,6 +956,7 @@ describe("alerts", () => {
 
 		await startedRun("app", 2 * HOUR, "ok");
 		await startedRun("broken", 30 * HOUR, "ok");
+		await startedRun("objects", 2 * HOUR, "ok");
 		const late = await lateAlert(env, Date.now());
 		expect(late?.subject).toBe("Gateweave Backup: the backup of broken is late");
 		expect(late?.html).toContain("background:#f79009");
@@ -821,6 +969,7 @@ describe("alerts", () => {
 		// A run cut off long ago is past, once a newer one ran.
 		await startedRun("broken", 50 * HOUR, "running");
 		await startedRun("broken", 2 * HOUR, "running");
+		await startedRun("objects", 6 * HOUR, "ok");
 		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 0 });
 		expect(await alerts()).toEqual([]);
 	});

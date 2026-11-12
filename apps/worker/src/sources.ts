@@ -5,7 +5,17 @@ export interface D1Source {
 	binding: string;
 }
 
-export type Source = D1Source;
+/**
+ * An app's Durable Objects, read through a service binding to the app's `Backup` entrypoint, which
+ * lists them and reads each one's SQLite (docs/architecture.md, "Sources").
+ */
+export interface ObjectsSource {
+	name: string;
+	kind: "do";
+	binding: string;
+}
+
+export type Source = D1Source | ObjectsSource;
 
 /** A mistake in the Worker's settings. Retrying doesn't fix it. */
 export class ConfigError extends Error {
@@ -39,11 +49,12 @@ export function parseSources(value: unknown): Source[] {
 		}
 		if (names.has(name)) throw new ConfigError(`Two sources are named ${name}.`);
 		names.add(name);
-		if (kind !== "d1") {
+		if (kind !== "d1" && kind !== "do") {
 			throw new ConfigError(`Source ${name} is of a kind this version can't back up yet.`);
 		}
 		if (typeof binding !== "string" || !BINDING.test(binding)) {
-			throw new ConfigError(`Source ${name} needs the name of its D1 binding.`);
+			const what = kind === "d1" ? "D1 binding" : "service binding to the app's Backup entrypoint";
+			throw new ConfigError(`Source ${name} needs the name of its ${what}.`);
 		}
 		return { name, kind, binding };
 	});

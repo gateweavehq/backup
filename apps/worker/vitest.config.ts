@@ -14,6 +14,19 @@ export default defineConfig({
 					BACKUP_KEY: TEST_KEY,
 					TEST_MIGRATIONS: await readD1Migrations(join(import.meta.dirname, "migrations")),
 				},
+				// An app whose Durable Objects are a source, as Track's are.
+				workers: [
+					{
+						name: "app",
+						modules: true,
+						scriptPath: join(import.meta.dirname, "test", "app-worker.js"),
+						compatibilityDate: "2026-11-01",
+						durableObjects: {
+							DIRECTORY: { className: "Directory", useSQLite: true },
+							STORE: { className: "Store", useSQLite: true },
+						},
+					},
+				],
 			},
 		})),
 	],

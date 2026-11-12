@@ -9,7 +9,42 @@
 /** The file a SQLite source's snapshot holds its dump in. */
 export const DUMP_FILE = "database.jsonl";
 
+/**
+ * Where a snapshot of many databases, one per Durable Object, keeps each one's dump:
+ * `objects/<name>.jsonl`.
+ */
+export const OBJECT_DIR = "objects/";
+
+/** An object's name as a file's: no slashes, and not starting with a dot. */
+const OBJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
+
+/** The file an object's dump goes in. */
+export function objectFile(name: string): string {
+	if (!OBJECT_NAME.test(name)) {
+		throw new DumpError(
+			"An object's name must be up to 200 letters, digits, dots, dashes and underscores, starting with a letter or digit.",
+		);
+	}
+	return `${OBJECT_DIR}${name}.jsonl`;
+}
+
+/** The object whose dump a file holds, or undefined for any other file. */
+export function objectOf(path: string): string | undefined {
+	if (!path.startsWith(OBJECT_DIR) || !path.endsWith(".jsonl")) return undefined;
+	const name = path.slice(OBJECT_DIR.length, -".jsonl".length);
+	return OBJECT_NAME.test(name) ? name : undefined;
+}
+
+/** Whether a snapshot's file is a database's dump: a D1 source's one, or one of an object's. */
+export function isDumpFile(path: string): boolean {
+	return path === DUMP_FILE || objectOf(path) !== undefined;
+}
+
 export type Row = Record<string, unknown>;
+
+export class DumpError extends Error {
+	override name = "DumpError";
+}
 
 /** Runs read-only statements together, as one consistent read, and returns each one's rows. */
 export interface SqlReader {
@@ -26,10 +61,6 @@ export interface DumpStats {
 export interface Dump {
 	lines: string[];
 	stats: DumpStats;
-}
-
-export class DumpError extends Error {
-	override name = "DumpError";
 }
 
 /** Double-quoted, so any name is safe in SQL. */

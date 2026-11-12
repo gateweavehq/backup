@@ -1,11 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import {
-	DUMP_FILE,
 	DumpError,
 	type DumpSummary,
 	describeStatement,
 	fromUtf8,
 	ident,
+	isDumpFile,
+	objectOf,
 	Repository,
 	RepositoryError,
 	restoreSql,
@@ -78,38 +79,51 @@ export class RestoreTest extends DurableObject<Env> {
 			await this.#test(source, snapshot, result);
 		} catch (error) {
 			if (!isFailure(error)) throw error;
-			result.error = error.message;
+			// A failed test counts nothing, though some of a snapshot's dumps came back before it.
+			Object.assign(result, { tables: 0, rows: 0, error: error.message });
 		} finally {
 			await this.ctx.storage.deleteAll();
 		}
 		return result;
 	}
 
-	/** Reads the snapshot back, checks every file, and restores its dump. */
+	/**
+	 * Reads the snapshot back, checks every file, and restores each dump: a D1 source's one, or each
+	 * of an app's objects, one after another, each into an empty database.
+	 */
 	async #test(source: string, snapshot: string, result: RestoreTestResult): Promise<void> {
 		const store = new R2Store(this.env.VAULT, `${source}/`);
 		const repo = await Repository.open(store, this.env.BACKUP_KEY);
 		const manifest = await repo.manifest(snapshot);
+		const many = manifest.files.filter((entry) => isDumpFile(entry.path)).length > 1;
+		let loaded = 0;
 		for (const entry of manifest.files) {
-			// Every file is read whole and checked against its size and hash; the dump is also restored.
-			if (entry.path !== DUMP_FILE) {
+			// Every file is read whole and checked against its size and hash; a dump is also restored.
+			if (!isDumpFile(entry.path)) {
 				await repo.readWholeFile(entry);
 				result.size += entry.size;
 				continue;
 			}
-			// The whole dump is in memory a few times over while it loads: see docs/deploy.md.
-			const lines = splitLines(fromUtf8(await repo.readWholeFile(entry)));
-			result.size += entry.size;
-			const summary = summarizeDump(lines);
-			const meant = manifest.meta.rows;
-			if (typeof meant === "number" && meant !== summary.rows) {
-				throw new RestoreFailure(
-					`The manifest says ${meant} rows; the dump holds ${summary.rows}.`,
-				);
+			try {
+				// The whole dump is in memory a few times over while it loads: see docs/deploy.md.
+				const lines = splitLines(fromUtf8(await repo.readWholeFile(entry)));
+				result.size += entry.size;
+				const summary = summarizeDump(lines);
+				if (loaded > 0) await this.ctx.storage.deleteAll();
+				this.#load(lines, summary);
+				loaded++;
+				result.tables += summary.tables.length;
+				result.rows += summary.rows;
+			} catch (error) {
+				// In a snapshot of many objects, a failure says which one.
+				if (!many || !isFailure(error)) throw error;
+				throw new RestoreFailure(`${objectOf(entry.path) ?? entry.path}: ${error.message}`);
 			}
-			this.#load(lines, summary);
-			result.tables = summary.tables.length;
-			result.rows = summary.rows;
+		}
+		const meant = manifest.meta.rows;
+		if (typeof meant === "number" && meant !== result.rows) {
+			const held = many ? "the dumps hold" : "the dump holds";
+			throw new RestoreFailure(`The manifest says ${meant} rows; ${held} ${result.rows}.`);
 		}
 		result.passed = true;
 	}

@@ -12,6 +12,11 @@
 		{ "binding": "RESTORE_DB", "database_name": "restore", "database_id": "restore" }
 	],
 	"r2_buckets": [{ "binding": "VAULT", "bucket_name": "vault" }],
+	// The stand-in app (test/app-worker.js): its Backup entrypoint, and a way to fill it.
+	"services": [
+		{ "binding": "APP", "service": "app", "entrypoint": "Backup" },
+		{ "binding": "APP_SEED", "service": "app", "entrypoint": "Seed" }
+	],
 	"durable_objects": {
 		"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
 	},
@@ -28,7 +33,8 @@
 	"vars": {
 		"SOURCES": [
 			{ "name": "app", "kind": "d1", "binding": "SOURCE_DB" },
-			{ "name": "broken", "kind": "d1", "binding": "VAULT" }
+			{ "name": "broken", "kind": "d1", "binding": "VAULT" },
+			{ "name": "objects", "kind": "do", "binding": "APP" }
 		],
 		"RETENTION": "1l 7d 4w 12m",
 		"RESTORE_TEST_DAYS": "30",

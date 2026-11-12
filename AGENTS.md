@@ -65,7 +65,8 @@ Requirements: Node.js 24 (see `.node-version`; 22.13+ works) and pnpm 12.
 - `apps/worker` tests run in workerd (`@cloudflare/vitest-plugin`): a real Workflow backs up a real
   D1 database into R2, and the test restores it into another. Restore tests run in a real Durable
   Object. workerd has no jurisdictions, so the tests leave `JURISDICTION` empty. Their key is public
-  and only theirs.
+  and only theirs. A stand-in app (`test/app-worker.js`) offers its Durable Objects through a
+  `Backup` entrypoint as Track does, and a `Seed` one for the tests to fill them.
 - A Workflow step's error comes back with its class name in front; the catalog stores it without.
 - Alert tests send to stand-ins: an `EMAIL` binding and a `fetch` of the test's own, never Email
   Service or the network.

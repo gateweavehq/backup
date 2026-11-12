@@ -54,6 +54,24 @@ Each D1 database to back up gets a binding in `d1_databases` and an entry in `SO
 
 A source's `name` is its folder in the bucket. Choose it once: a new name starts a new repository.
 
+### An app's Durable Objects
+
+An app that offers a `Backup` entrypoint, as Track does, gets a service binding to it and a source
+of kind `do`. The app must be a Worker in the same account:
+
+```jsonc
+"services": [{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" }],
+"vars": {
+	"SOURCES": [
+		{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
+		{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }
+	]
+}
+```
+
+The app says which objects there are; Track lists its workspaces. Each night's snapshot holds a
+dump per object, under its name, and stores only the dumps that changed.
+
 ## 4. Deploy and set the key
 
 ```sh
@@ -147,7 +165,10 @@ writes SQL for a new D1 database.
 
 ## What it can't do yet
 
-- Only D1 sources. Durable Objects, R2 and KV come next.
+- D1 and an app's Durable Objects only. R2 and KV come next.
+- The restore CLI writes a snapshot of an app's objects as stored, a dump per object. SQL for each
+  comes next.
+- An object is read in one call, which must fit in one response, as a D1 batch must.
 - One copy, in R2. The copy at another provider comes next.
 - A database is read in one D1 batch, which must fit in one response. Very large databases will need
   a paged mode.

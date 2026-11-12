@@ -56,15 +56,26 @@ the same account.
 
 ### Worker
 
-[deploy.md](deploy.md) says how to set it up. Today it backs up D1 into one R2 bucket, with the
-catalog, the lock and retention; the rest of this section is still to come where it says so.
+[deploy.md](deploy.md) says how to set it up. Today it backs up D1, and an app's Durable Objects
+through its `Backup` entrypoint, into one R2 bucket, with the catalog, the lock and retention; the
+rest of this section is still to come where it says so.
 
 - **Runs in the owner's own Cloudflare account,** through the Deploy button, so the data and the
   key never pass through Gateweave. A hosted version would hold a token for every customer's
   account. That makes it a target, so it comes later, if at all.
 - **Sources through bindings,** not API tokens: a D1 binding per database, an R2 binding per bucket,
-  a KV binding per namespace, and an RPC binding (`backup()`) for a Durable Object app that offers
-  one. Track, Agents and Mail will offer one first.
+  a KV binding per namespace, and a service binding to the `Backup` entrypoint of an app whose
+  Durable Objects hold its data. Track offers one; Agents and Mail will.
+- **An app's objects through the app.** A Worker can't open another Worker's Durable Objects, so
+  the app lends a reader with two methods: `objects(cursor)` lists the objects a page at a time,
+  and `read(name, statements)` runs a dump's reads in one of them, inside a transaction it always
+  rolls back, and answers null for one that is gone. The app checks that the statements only read.
+  The entrypoint has no route: a service binding from a Worker in the same account is its access.
+- **An app's objects make one snapshot.** The Workflow lists them in one step, dumps 20 to a step,
+  so a retry redoes 20 rather than all of them, and commits one manifest with a dump per object at
+  `objects/<name>.jsonl`. One deleted after the list was made is left out. Each dump is one
+  consistent read of its object; the snapshot isn't one moment across objects, which each stand
+  alone.
 - **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
   prune, test when due, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
@@ -82,7 +93,8 @@ catalog, the lock and retention; the rest of this section is still to come where
   `RESTORE_TEST_DAYS` old (30 by default) or it has none, so a failed one is tried again the next
   night. A Durable Object, one per source, reads every file back and checks it, makes the dump's
   tables in its own SQLite, loads the rows in one transaction, checks foreign keys, counts every
-  table against the dump, and rolls the rows back. It runs after the prune and under the lock, so
+  table against the dump, and rolls the rows back. A snapshot of an app's objects is tested a dump
+  at a time, each into an empty database. It runs after the prune and under the lock, so
   it also proves the prune kept what the snapshot needs. A failed test fails the run but keeps the
   backup, and the catalog says why.
 - **A restore test keeps no copy.** Only the empty tables are ever committed, and they are deleted

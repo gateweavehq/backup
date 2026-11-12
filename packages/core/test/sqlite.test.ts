@@ -6,7 +6,10 @@ import {
 	dumpSqlite,
 	ftsContent,
 	ident,
+	isDumpFile,
 	joinLines,
+	objectFile,
+	objectOf,
 	type Row,
 	restoreSql,
 	type SqlReader,
@@ -367,5 +370,21 @@ describe("a statement in an error", () => {
 		for (const [statement, description] of Object.entries(said)) {
 			expect(describeStatement(statement), statement).toBe(description);
 		}
+	});
+});
+
+describe("a snapshot of many objects", () => {
+	it("keeps each object's dump under its name, and nothing that could leave the folder", () => {
+		expect(objectFile("ws_01J9.x-y")).toBe("objects/ws_01J9.x-y.jsonl");
+		expect(objectOf("objects/ws_01J9.x-y.jsonl")).toBe("ws_01J9.x-y");
+		for (const bad of ["", ".hidden", "../up", "a/b", "a\b", "x".repeat(201), "with space"]) {
+			expect(() => objectFile(bad), bad).toThrow(DumpError);
+		}
+		for (const path of ["objects/.jsonl", "objects/a/b.jsonl", "objects/a.sql", "database.sql"]) {
+			expect(objectOf(path), path).toBeUndefined();
+		}
+		expect(isDumpFile("database.jsonl")).toBe(true);
+		expect(isDumpFile("objects/a.jsonl")).toBe(true);
+		expect(isDumpFile("notes.txt")).toBe(false);
 	});
 });

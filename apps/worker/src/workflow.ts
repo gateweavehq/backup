@@ -8,6 +8,8 @@ import { NonRetryableError } from "cloudflare:workflows";
 import {
 	DUMP_FILE,
 	dumpSqlite,
+	type FileEntry,
+	objectFile,
 	parseMasterKey,
 	parseRetention,
 	Repository,
@@ -16,7 +18,16 @@ import {
 	utf8,
 } from "@gateweave/backup-core";
 import { type Alert, AlertConfigError, runAlert, sendAlert } from "./alerts";
-import { d1Reader, isD1, R2Store } from "./bindings";
+import {
+	type BackupService,
+	d1Reader,
+	isD1,
+	isService,
+	listObjects,
+	ObjectGone,
+	objectReader,
+	R2Store,
+} from "./bindings";
 import {
 	failRun,
 	finishRun,
@@ -31,7 +42,13 @@ import {
 	testDue,
 } from "./catalog";
 import { type RestoreTestResult, testerFor, testInterval } from "./restore-test";
-import { parseSources, pickSources, type Source } from "./sources";
+import {
+	type D1Source,
+	type ObjectsSource,
+	parseSources,
+	pickSources,
+	type Source,
+} from "./sources";
 
 /** A manual run may name its sources; a scheduled one backs up all of them. */
 export interface BackupParams {
@@ -64,6 +81,19 @@ const ALERT: WorkflowStepConfig = {
 	retries: { limit: 4, delay: "30 seconds", backoff: "exponential" },
 	timeout: "1 minute",
 };
+
+/** How many of an app's objects one step backs up. A step that fails backs them up again. */
+const OBJECTS_PER_STEP = 20;
+
+/** One object's dump, written to the repository and waiting for the snapshot that names it. */
+interface ObjectPart {
+	name: string;
+	entry: FileEntry;
+	newBytes: number;
+	tables: number;
+	rows: number;
+	empty: string[];
+}
 
 /** A dump reads the whole database and writes what changed; a retry starts it over. */
 const HEAVY: WorkflowStepConfig = {
@@ -144,7 +174,10 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 					throw new NonRetryableError(`Another run is backing up ${name}.`);
 				}
 			});
-			const record = await step.do(`${name}: back up`, HEAVY, () => this.#snapshot(source));
+			const record =
+				source.kind === "d1"
+					? await step.do(`${name}: back up`, HEAVY, () => this.#snapshot(source))
+					: await this.#snapshotObjects(source, step);
 			snapshot = record.name;
 			await step.do(`${name}: record`, QUICK, () => recordSnapshot(db, id, record));
 			const made = record.name;
@@ -214,8 +247,88 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		return result;
 	}
 
+	/**
+	 * Backs up an app's Durable Objects: lists them, dumps them some at a time, one step each, then
+	 * commits one snapshot that holds every dump. An object deleted since it was listed is left out.
+	 */
+	async #snapshotObjects(source: ObjectsSource, step: WorkflowStep): Promise<SnapshotRecord> {
+		const name = source.name;
+		const names = await step.do(`${name}: list`, QUICK, () => listObjects(this.#service(source)));
+		const batches: string[][] = [];
+		for (let i = 0; i < names.length; i += OBJECTS_PER_STEP) {
+			batches.push(names.slice(i, i + OBJECTS_PER_STEP));
+		}
+		const parts: ObjectPart[] = [];
+		for (const [i, batch] of batches.entries()) {
+			const label = `${name}: back up ${i + 1} of ${batches.length}`;
+			parts.push(...(await step.do(label, HEAVY, () => this.#dumpObjects(source, batch))));
+		}
+		return step.do(`${name}: commit`, QUICK, async () => {
+			const repo = await this.#repository(source);
+			const tables = parts.reduce((sum, part) => sum + part.tables, 0);
+			const rows = parts.reduce((sum, part) => sum + part.rows, 0);
+			const empty = parts.flatMap((part) => part.empty.map((table) => `${part.name}/${table}`));
+			const meta = { objects: parts.length, tables, rows, empty };
+			const entries = parts.map((part) => part.entry);
+			const manifest = await repo.commit({ kind: "do", name }, entries, meta);
+			return {
+				source: name,
+				name: manifest.name,
+				created: manifest.created,
+				tables,
+				rows,
+				size: entries.reduce((sum, entry) => sum + entry.size, 0),
+				newBytes: parts.reduce((sum, part) => sum + part.newBytes, 0),
+				empty,
+			};
+		});
+	}
+
+	/** Dumps some of the app's objects into the repository, each in its own file. */
+	async #dumpObjects(source: ObjectsSource, names: string[]): Promise<ObjectPart[]> {
+		const service = this.#service(source);
+		const repo = await this.#repository(source);
+		const parts: ObjectPart[] = [];
+		for (const name of names) {
+			let path: string;
+			try {
+				path = objectFile(name);
+			} catch {
+				throw new NonRetryableError(`${source.name} listed an object whose name can't be a file.`);
+			}
+			let dump: Awaited<ReturnType<typeof dumpSqlite>>;
+			try {
+				dump = await dumpSqlite(objectReader(service, name));
+			} catch (error) {
+				if (error instanceof ObjectGone) continue;
+				throw error;
+			}
+			const { entry, stats } = await repo.writeFile(path, encodeLines(dump.lines));
+			parts.push({
+				name,
+				entry,
+				newBytes: stats.newBytes,
+				tables: dump.stats.tables,
+				rows: dump.stats.rows,
+				empty: dump.stats.empty,
+			});
+		}
+		return parts;
+	}
+
+	/** The app's Backup entrypoint, from the source's service binding. */
+	#service(source: ObjectsSource): BackupService {
+		const binding = (this.env as unknown as Record<string, unknown>)[source.binding];
+		if (!isService(binding)) {
+			throw new NonRetryableError(
+				`Source ${source.name}'s binding ${source.binding} isn't a service binding.`,
+			);
+		}
+		return binding;
+	}
+
 	/** Dumps the source and commits the dump as a snapshot. */
-	async #snapshot(source: Source): Promise<SnapshotRecord> {
+	async #snapshot(source: D1Source): Promise<SnapshotRecord> {
 		const binding = (this.env as unknown as Record<string, unknown>)[source.binding];
 		if (!isD1(binding)) {
 			throw new NonRetryableError(

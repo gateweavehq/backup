@@ -94,6 +94,12 @@ A manifest is JSON, sealed:
 `sha256` is the plain SHA-256 of the whole file, checked after a restore joins its chunks. `meta`
 holds what the source wants to say, such as a dump's table and row counts.
 
+A source of many databases, such as an app's Durable Objects, keeps each one's dump at
+`objects/<name>.jsonl`, under the object's name (`"kind": "do"`). A name is up to 200 letters,
+digits, dots, dashes and underscores, starting with a letter or digit, so it is always a plain file
+name. Its `meta` counts them all: `{"objects": 3, "tables": 69, "rows": 1840, "empty": []}`, where
+`empty` names a contentless table as `<object>/<table>`.
+
 ## SQLite dumps
 
 D1 and Durable Object databases are dumped to `database.jsonl`: one JSON object per line, in this

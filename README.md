@@ -4,7 +4,8 @@ Scheduled, encrypted backups of what your app keeps on Cloudflare: D1 databases,
 SQLite, R2 buckets and KV. A copy goes outside Cloudflare, and every month a restore proves the
 backups work.
 
-It is early. Today it backs up D1 databases every night into an R2 bucket:
+It is early. Today it backs up D1 databases, and the Durable Objects of an app that offers them,
+every night into an R2 bucket:
 
 - data is sealed with AES-256-GCM before it leaves, under a key only you hold;
 - content-defined chunking, so a nightly backup stores only what changed;
@@ -17,7 +18,7 @@ It is early. Today it backs up D1 databases every night into an R2 bucket:
 - a restore CLI, one file for Node, reads the bucket with the key alone and writes SQL for a new D1
   database or a SQLite file, never over anything.
 
-Durable Objects, R2 and KV sources and the copy outside Cloudflare come next. See [docs/deploy.md](docs/deploy.md), [docs/restore.md](docs/restore.md),
+R2 and KV sources and the copy outside Cloudflare come next. See [docs/deploy.md](docs/deploy.md), [docs/restore.md](docs/restore.md),
 [docs/architecture.md](docs/architecture.md) and [docs/format.md](docs/format.md).
 
 ## License

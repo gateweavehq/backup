@@ -13,6 +13,59 @@ export function d1Reader(db: D1Database): SqlReader {
 	};
 }
 
+/**
+ * An app's `Backup` entrypoint, through a service binding: it lists the Durable Objects to back
+ * up, a page at a time, and runs a dump's reads in one of them, rolled back. `read` answers null
+ * for an object that is gone, such as a workspace deleted since it was listed.
+ */
+export interface BackupService {
+	objects(cursor?: string): Promise<{ names: string[]; cursor?: string }>;
+	read(name: string, statements: string[]): Promise<Row[][] | null>;
+}
+
+/**
+ * Whether a binding is a service binding, as far as a backup can tell before calling it: it has
+ * `fetch`, which D1 and R2 bindings don't. Its stub answers any method name, so nothing more shows.
+ */
+export function isService(value: unknown): value is BackupService {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as { fetch?: unknown }).fetch === "function"
+	);
+}
+
+/** Every object the app lists, in its order. */
+export async function listObjects(service: BackupService): Promise<string[]> {
+	const names: string[] = [];
+	let cursor: string | undefined;
+	do {
+		const page = await service.objects(cursor);
+		names.push(...page.names);
+		if (page.cursor !== undefined && page.cursor === cursor) {
+			throw new Error("The app's list of objects went round in a circle.");
+		}
+		cursor = page.cursor;
+	} while (cursor !== undefined);
+	return names;
+}
+
+/** An object that the app no longer has: it was deleted after it was listed. */
+export class ObjectGone extends Error {
+	override name = "ObjectGone";
+}
+
+/** Reads one of the app's objects, as `dumpSqlite` reads a database. */
+export function objectReader(service: BackupService, name: string): SqlReader {
+	return {
+		async readTogether(statements) {
+			const rows = await service.read(name, statements);
+			if (rows === null) throw new ObjectGone(`${name} is gone.`);
+			return rows;
+		},
+	};
+}
+
 /** Whether a binding is a D1 database, as far as a backup needs one. */
 export function isD1(value: unknown): value is D1Database {
 	return (

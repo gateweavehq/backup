@@ -1,4 +1,4 @@
-import type { ObjectStore, Row, SqlReader } from "@gateweave/backup-core";
+import type { BucketObject, ObjectStore, Row, SqlReader } from "@gateweave/backup-core";
 
 /**
  * Reads a D1 database. A batch runs as one transaction, so the statements see the same moment:
@@ -74,6 +74,37 @@ export function isD1(value: unknown): value is D1Database {
 		typeof (value as D1Database).batch === "function" &&
 		typeof (value as D1Database).prepare === "function"
 	);
+}
+
+/**
+ * Whether a binding is an R2 bucket. A service binding's stub answers any method name, so it is
+ * told apart by `fetch`, which a bucket hasn't.
+ */
+export function isR2(value: unknown): value is R2Bucket {
+	if (typeof value !== "object" || value === null) return false;
+	const bucket = value as Partial<Record<"list" | "get" | "head" | "fetch", unknown>>;
+	return (
+		typeof bucket.list === "function" &&
+		typeof bucket.get === "function" &&
+		typeof bucket.head === "function" &&
+		typeof bucket.fetch !== "function"
+	);
+}
+
+/** An object as a snapshot lists it: its key, size, version and the metadata R2 keeps with it. */
+export function describeObject(object: R2Object): BucketObject {
+	const { cacheExpiry, ...http } = object.httpMetadata ?? {};
+	return {
+		key: object.key,
+		size: object.size,
+		etag: object.etag,
+		uploaded: object.uploaded.toISOString(),
+		http: {
+			...Object.fromEntries(Object.entries(http).filter(([, value]) => typeof value === "string")),
+			...(cacheExpiry ? { cacheExpiry: cacheExpiry.toISOString() } : {}),
+		},
+		custom: { ...object.customMetadata },
+	};
 }
 
 /** A repository's objects in an R2 bucket, under a folder of their own. */

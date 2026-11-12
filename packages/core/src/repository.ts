@@ -82,6 +82,17 @@ const SECOND_LENGTH = 16;
 /** Only objects named as chunks are pruned; anything else under `data/` isn't ours to delete. */
 const CHUNK_KEY = /^data\/([0-9a-f]{2})\/(\1[0-9a-f]{62})$/;
 
+/** How far ahead of now the newest snapshot may be and still have been pushed there, not dated. */
+const AHEAD_MS = 60_000;
+
+/** The time a snapshot's name tells, to the second. */
+function secondOf(name: string | undefined): number | undefined {
+	const parts = name === undefined ? null : /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z/.exec(name);
+	if (!parts) return undefined;
+	const [, y, mo, d, h, mi, s] = parts;
+	return Date.parse(`${y}-${mo}-${d}T${h}:${mi}:${s}Z`);
+}
+
 /** A snapshot's name: when it was made, to the second, and a random part. They sort by time. */
 export function snapshotName(at: Date): string {
 	const stamp = at
@@ -215,7 +226,10 @@ export class Repository {
 	 * Seals and stores a snapshot's manifest. The snapshot exists once this returns.
 	 *
 	 * Names tell the time to the second, and retention takes the newest by name. So a snapshot made
-	 * in a second that already has one takes the next free second, and the newer sorts last.
+	 * in a second that already has one takes the next free second, and the newer sorts last. The
+	 * newest snapshot may be a few seconds ahead, pushed there by others made in the same second:
+	 * then the next goes after it, even when the second it was made in is free again because a
+	 * snapshot there was forgotten.
 	 */
 	async commit(
 		source: SourceInfo,
@@ -223,8 +237,11 @@ export class Repository {
 		meta: Record<string, unknown> = {},
 		now = new Date(),
 	): Promise<Manifest> {
-		const taken = new Set((await this.snapshots()).map((n) => n.slice(0, SECOND_LENGTH)));
+		const names = await this.snapshots();
+		const taken = new Set(names.map((n) => n.slice(0, SECOND_LENGTH)));
 		let at = now.getTime();
+		const newest = secondOf(names.at(-1));
+		if (newest !== undefined && newest >= at - 1000 && newest <= at + AHEAD_MS) at = newest + 1000;
 		while (taken.has(snapshotName(new Date(at)).slice(0, SECOND_LENGTH))) at += 1000;
 		const name = snapshotName(new Date(at));
 		const manifest: Manifest = {
@@ -343,6 +360,22 @@ export class Repository {
 	 */
 	async readFileChunks(entry: FileEntry): Promise<Uint8Array<ArrayBuffer>[]> {
 		const chunks: Uint8Array<ArrayBuffer>[] = [];
+		for await (const chunk of this.#checked(entry)) chunks.push(chunk);
+		return chunks;
+	}
+
+	/**
+	 * Reads a file through and checks it against its size and SHA-256, holding one chunk at a time:
+	 * for a file that only has to be proved whole, however large.
+	 */
+	async checkFile(entry: FileEntry): Promise<void> {
+		for await (const _chunk of this.#checked(entry)) {
+			// Each chunk is checked against its id as it is read, and the whole at the end.
+		}
+	}
+
+	/** A file's chunks as they come, then a check of the whole against its size and SHA-256. */
+	async *#checked(entry: FileEntry): AsyncGenerator<Uint8Array<ArrayBuffer>> {
 		const hash = new Sha256();
 		let size = 0;
 		for await (const chunk of this.readFile(entry)) {
@@ -350,12 +383,11 @@ export class Repository {
 			if (size > entry.size) {
 				throw new RepositoryError(`${entry.path} is longer than its manifest says.`);
 			}
-			chunks.push(chunk);
+			yield chunk;
 			await hash.update(chunk);
 		}
 		if (size !== entry.size || (await hash.digest()) !== entry.sha256) {
 			throw new RepositoryError(`${entry.path} doesn't match its manifest.`);
 		}
-		return chunks;
 	}
 }

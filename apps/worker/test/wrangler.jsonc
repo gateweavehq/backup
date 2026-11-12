@@ -11,7 +11,11 @@
 		{ "binding": "SOURCE_DB", "database_name": "source", "database_id": "source" },
 		{ "binding": "RESTORE_DB", "database_name": "restore", "database_id": "restore" }
 	],
-	"r2_buckets": [{ "binding": "VAULT", "bucket_name": "vault" }],
+	"r2_buckets": [
+		{ "binding": "VAULT", "bucket_name": "vault" },
+		// A bucket of an app's files, as Track's are.
+		{ "binding": "FILES", "bucket_name": "files" }
+	],
 	// The stand-in app (test/app-worker.js): its Backup entrypoint, and a way to fill it.
 	"services": [
 		{ "binding": "APP", "service": "app", "entrypoint": "Backup" },
@@ -34,7 +38,8 @@
 		"SOURCES": [
 			{ "name": "app", "kind": "d1", "binding": "SOURCE_DB" },
 			{ "name": "broken", "kind": "d1", "binding": "VAULT" },
-			{ "name": "objects", "kind": "do", "binding": "APP" }
+			{ "name": "objects", "kind": "do", "binding": "APP" },
+			{ "name": "files", "kind": "r2", "binding": "FILES" }
 		],
 		"RETENTION": "1l 7d 4w 12m",
 		"RESTORE_TEST_DAYS": "30",

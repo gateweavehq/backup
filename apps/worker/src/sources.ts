@@ -15,7 +15,23 @@ export interface ObjectsSource {
 	binding: string;
 }
 
-export type Source = D1Source | ObjectsSource;
+/** An R2 bucket's objects, with their metadata, read through its binding. */
+export interface R2Source {
+	name: string;
+	kind: "r2";
+	binding: string;
+}
+
+export type Source = D1Source | ObjectsSource | R2Source;
+
+const KINDS = ["d1", "do", "r2"] as const;
+
+/** What a source's binding is, said when it is missing. */
+const BINDINGS: Record<Source["kind"], string> = {
+	d1: "D1 binding",
+	do: "service binding to the app's Backup entrypoint",
+	r2: "R2 bucket binding",
+};
 
 /** A mistake in the Worker's settings. Retrying doesn't fix it. */
 export class ConfigError extends Error {
@@ -49,14 +65,14 @@ export function parseSources(value: unknown): Source[] {
 		}
 		if (names.has(name)) throw new ConfigError(`Two sources are named ${name}.`);
 		names.add(name);
-		if (kind !== "d1" && kind !== "do") {
+		const known = KINDS.find((k) => k === kind);
+		if (!known) {
 			throw new ConfigError(`Source ${name} is of a kind this version can't back up yet.`);
 		}
 		if (typeof binding !== "string" || !BINDING.test(binding)) {
-			const what = kind === "d1" ? "D1 binding" : "service binding to the app's Backup entrypoint";
-			throw new ConfigError(`Source ${name} needs the name of its ${what}.`);
+			throw new ConfigError(`Source ${name} needs the name of its ${BINDINGS[known]}.`);
 		}
-		return { name, kind, binding };
+		return { name, kind: known, binding };
 	});
 }
 

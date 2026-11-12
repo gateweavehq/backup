@@ -1,3 +1,4 @@
+export * from "./bucket";
 export * from "./bytes";
 export * from "./cdc";
 export * from "./keys";

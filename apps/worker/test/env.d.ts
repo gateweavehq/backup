@@ -3,6 +3,7 @@ declare namespace Cloudflare {
 	interface Env {
 		SOURCE_DB: D1Database;
 		RESTORE_DB: D1Database;
+		FILES: R2Bucket;
 		TEST_MIGRATIONS: import("cloudflare:test").D1Migration[];
 		APP_SEED: {
 			add(name: string, statements: string[]): Promise<void>;

@@ -72,6 +72,24 @@ of kind `do`. The app must be a Worker in the same account:
 The app says which objects there are; Track lists its workspaces. Each night's snapshot holds a
 dump per object, under its name, and stores only the dumps that changed.
 
+### An R2 bucket
+
+A bucket gets an R2 binding and a source of kind `r2`. Each night's snapshot holds every object,
+with its metadata, and reads only the objects that are new or were replaced since the last one:
+
+```jsonc
+"r2_buckets": [
+	{ "binding": "VAULT", "bucket_name": "gateweave-backup" },
+	{ "binding": "TRACK_FILES", "bucket_name": "gateweave-track-files" }
+],
+"vars": {
+	"SOURCES": [{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }]
+}
+```
+
+The binding needs only to read, but Workers bindings can't be made read-only: the backup lists and
+gets, and never writes there. `VAULT` itself can't be a source.
+
 ## 4. Deploy and set the key
 
 ```sh
@@ -161,11 +179,14 @@ its `error`, and the daily check sends it again for three days.
 ## Restoring
 
 [restore.md](restore.md): the CLI reads the bucket with a read-only R2 token and the key, and
-writes SQL for a new D1 database.
+writes SQL for a new D1 database, or a bucket's objects to a folder.
 
 ## What it can't do yet
 
-- D1 and an app's Durable Objects only. R2 and KV come next.
+- D1, an app's Durable Objects and R2 buckets. KV comes next.
+- A bucket's backup takes a Workflow step per 1,000 objects listed and per 100 objects or 256 MB
+  read, so the first backup of a bucket of hundreds of thousands of objects takes too many steps
+  for one run. Later runs read only what is new.
 - One copy, in R2. The copy at another provider comes next.
 - A database whose rows come to more than 12 million characters is read a page at a time (see
   [Core](architecture.md#core)). One that changes during each of three tries is kept anyway, and

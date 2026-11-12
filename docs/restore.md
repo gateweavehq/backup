@@ -106,6 +106,27 @@ node gateweave-backup.mjs restore s3://gateweave-backup/track-workspaces latest 
 Each file is one object's database. Read it with `sqlite3`, or load the SQL into a new D1 database
 to look at it. Putting it back into the live app's object is the app's to offer; Track doesn't yet.
 
+## Restore an R2 bucket's objects
+
+A snapshot of a bucket, such as Track's files, holds every object's bytes and `bucket.json`, which
+lists them with their metadata ([format.md](format.md#manifests)). `restore` writes them to a
+folder: `bucket.json`, and each object at `files/<key>`.
+
+```sh
+node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest --to ./restore
+```
+
+A key that can't be a path in a folder, such as one with `..` or `//` in it, stops the restore and
+says so. To put an object back, upload its file under its key with the type `bucket.json` gives it:
+
+```sh
+npx wrangler r2 object put gateweave-track-files/<key> --remote \
+  --file "./restore/files/<key>" --content-type "<contentType>"
+```
+
+Wrangler can't set custom metadata, such as Track's `uploadedBy`. A restore straight into a
+bucket, with all of its metadata, comes next in the CLI.
+
 ## When it fails
 
 The CLI says what went wrong and names the object, never what is in it:

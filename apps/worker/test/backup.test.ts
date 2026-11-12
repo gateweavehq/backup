@@ -5,15 +5,18 @@ import {
 } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import {
+	type BucketObject,
 	concat,
 	dumpSqlite,
 	fromUtf8,
 	generateMasterKey,
 	joinLines,
 	Repository,
+	readBucketIndex,
 	restoreSql,
 	splitLines,
 	utf8,
+	writeBucketIndex,
 } from "@gateweave/backup-core";
 import { beforeEach, describe, expect, it } from "vitest";
 import worker from "../src";
@@ -26,7 +29,13 @@ import {
 	lateAlert,
 	runAlert,
 } from "../src/alerts";
-import { type BackupService, d1Reader, objectReader, R2Store } from "../src/bindings";
+import {
+	type BackupService,
+	d1Reader,
+	describeObject,
+	objectReader,
+	R2Store,
+} from "../src/bindings";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
 
@@ -60,8 +69,13 @@ beforeEach(async () => {
 		env.CATALOG.prepare("DELETE FROM restore_test"),
 		env.CATALOG.prepare("DELETE FROM alert"),
 	]);
-	const listed = await env.VAULT.list();
-	if (listed.objects.length > 0) await env.VAULT.delete(listed.objects.map((o) => o.key));
+	for (const bucket of [env.VAULT, env.FILES]) {
+		let listed = await bucket.list();
+		while (listed.objects.length > 0) {
+			await bucket.delete(listed.objects.map((o) => o.key));
+			listed = await bucket.list();
+		}
+	}
 	await env.APP_SEED.clear();
 	await env.SOURCE_DB.batch([
 		env.SOURCE_DB.prepare(
@@ -274,6 +288,8 @@ describe("a backup run", () => {
 			"          The backup failed. The snapshots made before it stay.",
 			"          Source broken's binding VAULT isn't a D1 database.",
 			"objects   Backed up",
+			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
+			"files     Backed up",
 			expect.stringMatching(/^ {10}Snapshot \d{8}T\S+, restored and counted by a restore test\.$/),
 			"",
 			"The catalog's run and restore_test tables have the details, under this run's id:",
@@ -498,6 +514,224 @@ describe("an app's Durable Objects", () => {
 			}),
 		]);
 		expect(await (await repository("objects")).snapshots()).toEqual([]);
+	});
+});
+
+/** Objects with what R2 keeps beside their bytes: a type, custom metadata, a cache setting. */
+async function addFiles() {
+	const big = new Uint8Array(300_000);
+	for (let i = 0; i < big.length; i += 65_536) {
+		crypto.getRandomValues(big.subarray(i, Math.min(i + 65_536, big.length)));
+	}
+	await env.FILES.put("w1/i1/one.txt", "hello", {
+		httpMetadata: { contentType: "text/plain; charset=utf-8" },
+		customMetadata: { uploadedBy: "user-1" },
+	});
+	await env.FILES.put("w1/i2/big.bin", big, {
+		httpMetadata: { contentType: "application/octet-stream", cacheControl: "private, max-age=60" },
+	});
+	await env.FILES.put("w2/Grüße 🙂.txt", "Grüße", {
+		httpMetadata: { contentDisposition: 'attachment; filename="gruesse.txt"' },
+	});
+	await env.FILES.put("w2/empty", new Uint8Array(0));
+	return big;
+}
+
+/** The objects in FILES, as a snapshot lists them. */
+async function filesNow(): Promise<BucketObject[]> {
+	const listed = await env.FILES.list({ include: ["httpMetadata", "customMetadata"] });
+	return listed.objects.map(describeObject);
+}
+
+async function fileBytes(repo: Repository, name: string, key: string) {
+	const entry = (await repo.manifest(name)).files.find((file) => file.path === `files/${key}`);
+	if (!entry) throw new Error(`The snapshot has no file for ${key}.`);
+	return repo.readWholeFile(entry);
+}
+
+describe("an R2 bucket", () => {
+	it("goes into one snapshot with every object's bytes and metadata, and passes a restore test", async () => {
+		const big = await addFiles();
+		const result = await backUp("bucket", { sources: ["files"] });
+		expect(result).toEqual({
+			ended: "complete",
+			output: [
+				{
+					source: "files",
+					status: "ok",
+					snapshot: expect.stringMatching(/^\d{8}T/),
+					test: "passed",
+				},
+			],
+		});
+
+		const repo = await repository("files");
+		const [name] = await repo.snapshots();
+		if (!name) throw new Error("No snapshot was made.");
+		const manifest = await repo.manifest(name);
+		expect(manifest.source).toEqual({ kind: "r2", name: "files" });
+		expect(manifest.files.map((entry) => entry.path)).toEqual([
+			"bucket.json",
+			"files/w1/i1/one.txt",
+			"files/w1/i2/big.bin",
+			"files/w2/Grüße 🙂.txt",
+			"files/w2/empty",
+		]);
+		const bytes = 5 + big.length + utf8("Grüße").length;
+		expect(manifest.meta).toEqual({ objects: 4, bytes, read: 4, reused: 0 });
+
+		const index = manifest.files[0];
+		if (!index) throw new Error("The snapshot has no bucket.json.");
+		const listed = readBucketIndex(await repo.readWholeFile(index));
+		expect(listed).toEqual(await filesNow());
+		expect(listed[0]).toMatchObject({
+			key: "w1/i1/one.txt",
+			http: { contentType: "text/plain; charset=utf-8" },
+			custom: { uploadedBy: "user-1" },
+		});
+		expect(listed[1]?.http).toEqual({
+			contentType: "application/octet-stream",
+			cacheControl: "private, max-age=60",
+		});
+		expect(fromUtf8(await fileBytes(repo, name, "w1/i1/one.txt"))).toBe("hello");
+		expect(await fileBytes(repo, name, "w1/i2/big.bin")).toEqual(big);
+		expect(fromUtf8(await fileBytes(repo, name, "w2/Grüße 🙂.txt"))).toBe("Grüße");
+		expect((await fileBytes(repo, name, "w2/empty")).length).toBe(0);
+
+		expect(await runs()).toEqual([
+			expect.objectContaining({
+				id: "bucket/files",
+				status: "ok",
+				snapshot: name,
+				table_count: 0,
+				row_count: 0,
+				object_count: 4,
+				size: bytes + index.size,
+				error: null,
+			}),
+		]);
+		expect(await tests()).toEqual([
+			expect.objectContaining({
+				run: "bucket/files",
+				status: "passed",
+				object_count: 4,
+				size: bytes + index.size,
+				error: null,
+			}),
+		]);
+		expect(await testerTables("files")).toEqual([]);
+	});
+
+	it("reads only the objects that changed since the last snapshot", async () => {
+		await addFiles();
+		await backUp("first", { sources: ["files"] });
+		await env.FILES.put("w1/i1/one.txt", "hello again", {
+			httpMetadata: { contentType: "text/plain; charset=utf-8" },
+		});
+		await env.FILES.delete("w2/empty");
+		await env.FILES.put("w3/new.txt", "new");
+		await backUp("second", { sources: ["files"] });
+
+		// Retention keeps a day's newest snapshot, so each run's is the one there.
+		const repo = await repository("files");
+		const newest = async () => (await repo.snapshots()).at(-1) ?? "";
+		const second = await newest();
+		const changed = await repo.manifest(second);
+		expect(changed.files.map((entry) => entry.path)).toEqual([
+			"bucket.json",
+			"files/w1/i1/one.txt",
+			"files/w1/i2/big.bin",
+			"files/w2/Grüße 🙂.txt",
+			"files/w3/new.txt",
+		]);
+		expect(changed.meta).toMatchObject({ objects: 4, read: 2, reused: 2 });
+		expect(fromUtf8(await fileBytes(repo, second, "w1/i1/one.txt"))).toBe("hello again");
+		const index = changed.files[0];
+		if (!index) throw new Error("The snapshot has no bucket.json.");
+		expect(readBucketIndex(await repo.readWholeFile(index))).toEqual(await filesNow());
+		expect(await backUp("third", { sources: ["files"] })).toMatchObject({ ended: "complete" });
+		const third = await newest();
+		expect(third).not.toBe(second);
+		expect((await repo.manifest(third)).meta).toMatchObject({ objects: 4, read: 0, reused: 4 });
+
+		const [first, after, same] = await runs();
+		expect(Number(after?.new_bytes)).toBeGreaterThan(0);
+		expect(Number(after?.new_bytes)).toBeLessThan(Number(first?.new_bytes) / 10);
+		// Nothing changed: no object was read, and bucket.json came out the same.
+		expect(same?.new_bytes).toBe(0);
+	});
+
+	it("leaves out an object deleted after the listing", async () => {
+		await addFiles();
+		const gone: BucketObject = {
+			key: "w0/gone.txt",
+			size: 4,
+			etag: "0123",
+			uploaded: new Date().toISOString(),
+			http: {},
+			custom: {},
+		};
+		const listed = [{ object: gone }, ...(await filesNow()).map((object) => ({ object }))];
+		const result = await backUp("deleted", { sources: ["files"] }, (m) =>
+			m.mockStepResult({ name: "files: list 1" }, { objects: listed }),
+		);
+		expect(result).toMatchObject({ ended: "complete", output: [{ status: "ok", test: "passed" }] });
+		const repo = await repository("files");
+		const [name] = await repo.snapshots();
+		const manifest = await repo.manifest(name ?? "");
+		expect(manifest.meta).toMatchObject({ objects: 4, read: 4 });
+		expect(manifest.files.some((entry) => entry.path === "files/w0/gone.txt")).toBe(false);
+	});
+
+	it("is listed a part at a time when its listing is large", async () => {
+		// About 2 KB of metadata each, so the listing passes what one step's answer may hold.
+		const custom = { note: "x".repeat(1900) };
+		const keys = Array.from({ length: 300 }, (_, i) => `many/${String(i).padStart(3, "0")}`);
+		for (let i = 0; i < keys.length; i += 50) {
+			await Promise.all(
+				keys.slice(i, i + 50).map((key) => env.FILES.put(key, key, { customMetadata: custom })),
+			);
+		}
+		const result = await backUp("many", { sources: ["files"] });
+		expect(result).toMatchObject({ ended: "complete", output: [{ status: "ok", test: "passed" }] });
+		const repo = await repository("files");
+		const [name] = await repo.snapshots();
+		const manifest = await repo.manifest(name ?? "");
+		expect(manifest.files.slice(1).map((entry) => entry.path)).toEqual(
+			keys.map((key) => `files/${key}`),
+		);
+		expect(manifest.meta).toMatchObject({ objects: 300, read: 300 });
+	});
+
+	it("fails a restore test when bucket.json lists an object the snapshot doesn't hold", async () => {
+		const repo = await Repository.init(new R2Store(env.VAULT, "crafted/"), env.BACKUP_KEY);
+		const object = (key: string, size: number): BucketObject => ({
+			key,
+			size,
+			etag: key,
+			uploaded: "2026-11-12T00:00:00.000Z",
+			http: {},
+			custom: {},
+		});
+		const kept = await repo.writeFile("files/a", utf8("kept"));
+		const index = await repo.writeFile(
+			"bucket.json",
+			writeBucketIndex([object("a", 4), object("b", 7)]),
+		);
+		const snapshot = (
+			await repo.commit({ kind: "r2", name: "crafted" }, [index.entry, kept.entry], { objects: 2 })
+		).name;
+
+		const test = await testerFor(env, "crafted").restore("crafted", snapshot);
+		expect(test).toEqual({
+			source: "crafted",
+			snapshot,
+			passed: false,
+			tables: 0,
+			rows: 0,
+			size: expect.any(Number),
+			error: "bucket.json lists an object of 7 bytes that the snapshot doesn't hold.",
+		});
 	});
 });
 
@@ -932,6 +1166,7 @@ describe("alerts", () => {
 
 		await startedRun("broken", HOUR, "ok");
 		await startedRun("objects", HOUR, "ok");
+		await startedRun("files", HOUR, "ok");
 		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 1 });
 		expect(await alerts()).toEqual([
 			expect.objectContaining({ key: "run:unsent", sent_to: "", error: null }),
@@ -942,6 +1177,7 @@ describe("alerts", () => {
 		await startedRun("app", 30 * HOUR, "ok");
 		await startedRun("broken", 6 * HOUR, "running");
 		await startedRun("objects", 2 * HOUR, "ok");
+		await startedRun("files", 2 * HOUR, "ok");
 		const controller = createScheduledController({ scheduledTime: Date.now(), cron: "17 9 * * *" });
 		await worker.scheduled(controller, env);
 
@@ -962,6 +1198,8 @@ describe("alerts", () => {
 			"broken    Stuck",
 			expect.stringMatching(new RegExp(`^ {10}The backup that started ${time} hasn't ended\\.$`)),
 			"objects   On time",
+			expect.stringMatching(new RegExp(`^ {10}Last started ${time}\\.$`)),
+			"files     On time",
 			expect.stringMatching(new RegExp(`^ {10}Last started ${time}\\.$`)),
 			"",
 			"The nightly run didn't start, or stopped part way. The Workflow's instances say which:",
@@ -1019,6 +1257,7 @@ describe("alerts", () => {
 		await startedRun("app", 2 * HOUR, "ok");
 		await startedRun("broken", 30 * HOUR, "ok");
 		await startedRun("objects", 2 * HOUR, "ok");
+		await startedRun("files", 2 * HOUR, "ok");
 		const late = await lateAlert(env, Date.now());
 		expect(late?.subject).toBe("Gateweave Backup: the backup of broken is late");
 		expect(late?.html).toContain("background:#f79009");
@@ -1032,6 +1271,7 @@ describe("alerts", () => {
 		await startedRun("broken", 50 * HOUR, "running");
 		await startedRun("broken", 2 * HOUR, "running");
 		await startedRun("objects", 6 * HOUR, "ok");
+		await startedRun("files", 6 * HOUR, "ok");
 		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 0 });
 		expect(await alerts()).toEqual([]);
 	});

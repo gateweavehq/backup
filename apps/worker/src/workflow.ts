@@ -6,6 +6,10 @@ import {
 } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import {
+	BUCKET_INDEX,
+	BucketIndexError,
+	type BucketObject,
+	bucketFile,
 	DUMP_FILE,
 	dumpSqliteTo,
 	type FileEntry,
@@ -14,15 +18,20 @@ import {
 	parseRetention,
 	Repository,
 	RepositoryError,
+	readBucketIndex,
 	retain,
+	SealError,
 	type SqlReader,
 	utf8,
+	writeBucketIndex,
 } from "@gateweave/backup-core";
 import { type Alert, AlertConfigError, runAlert, sendAlert } from "./alerts";
 import {
 	type BackupService,
 	d1Reader,
+	describeObject,
 	isD1,
+	isR2,
 	isService,
 	listObjects,
 	ObjectGone,
@@ -48,6 +57,7 @@ import {
 	type ObjectsSource,
 	parseSources,
 	pickSources,
+	type R2Source,
 	type Source,
 } from "./sources";
 
@@ -96,6 +106,36 @@ interface ObjectPart {
 	empty: string[];
 	/** Whether its rows were read at one moment; see dumpSqliteTo. */
 	consistent: boolean;
+}
+
+/**
+ * How many of a bucket's objects one step lists, and about how much its answer may hold: a step's
+ * answer is kept, and has a limit of its own.
+ */
+const LIST_OBJECTS = 1000;
+const LIST_BYTES = 512 * 1024;
+
+/** How much of a bucket one step reads: this many objects, or bytes, whichever comes first. */
+const READ_OBJECTS = 100;
+const READ_BYTES = 256 * 1024 * 1024;
+
+/** An object a listing found, with its file when the last snapshot holds these very bytes. */
+interface ListedObject {
+	object: BucketObject;
+	entry?: FileEntry;
+}
+
+/** Where a bucket's listing goes on: after a key, or from R2's cursor. */
+interface ListFrom {
+	after?: string;
+	cursor?: string;
+}
+
+/** An object read into the repository, and what it cost. */
+interface ReadObject {
+	object: BucketObject;
+	entry: FileEntry;
+	newBytes: number;
 }
 
 /** A dump reads the whole database and writes what changed; a retry starts it over. */
@@ -180,7 +220,9 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			const record =
 				source.kind === "d1"
 					? await step.do(`${name}: back up`, HEAVY, () => this.#snapshot(source))
-					: await this.#snapshotObjects(source, step);
+					: source.kind === "do"
+						? await this.#snapshotObjects(source, step)
+						: await this.#snapshotBucket(source, step);
 			snapshot = record.name;
 			await step.do(`${name}: record`, QUICK, () => recordSnapshot(db, id, record));
 			const made = record.name;
@@ -288,6 +330,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				created: manifest.created,
 				tables,
 				rows,
+				objects: parts.length,
 				size: entries.reduce((sum, entry) => sum + entry.size, 0),
 				newBytes: parts.reduce((sum, part) => sum + part.newBytes, 0),
 				empty,
@@ -326,6 +369,174 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			});
 		}
 		return parts;
+	}
+
+	/**
+	 * Backs up an R2 bucket: lists it, reads the objects the last snapshot doesn't hold already, some
+	 * at a time, a step each, then commits one snapshot that holds them all and lists them, with
+	 * their metadata, in bucket.json. An object deleted after it was listed is left out.
+	 */
+	async #snapshotBucket(source: R2Source, step: WorkflowStep): Promise<SnapshotRecord> {
+		const name = source.name;
+		const listed: ListedObject[] = [];
+		let from: ListFrom | undefined = {};
+		for (let page = 1; from; page++) {
+			const start: ListFrom = from;
+			const found = await step.do(`${name}: list ${page}`, HEAVY, () =>
+				this.#listBucket(source, start),
+			);
+			listed.push(...found.objects);
+			from = found.next;
+		}
+		const batches: string[][] = [];
+		let batch: string[] = [];
+		let bytes = 0;
+		for (const { object, entry } of listed) {
+			if (entry) continue;
+			if (batch.length >= READ_OBJECTS || (batch.length > 0 && bytes + object.size > READ_BYTES)) {
+				batches.push(batch);
+				batch = [];
+				bytes = 0;
+			}
+			batch.push(object.key);
+			bytes += object.size;
+		}
+		if (batch.length > 0) batches.push(batch);
+		const read: ReadObject[] = [];
+		for (const [i, keys] of batches.entries()) {
+			const label = `${name}: back up ${i + 1} of ${batches.length}`;
+			read.push(...(await step.do(label, HEAVY, () => this.#readObjects(source, keys))));
+		}
+		return step.do(`${name}: commit`, HEAVY, async () => {
+			const repo = await this.#repository(source);
+			const kept = listed.flatMap(({ object, entry }) => (entry ? [{ object, entry }] : []));
+			const objects = [...kept, ...read].sort((a, b) => (a.object.key < b.object.key ? -1 : 1));
+			const index = await repo.writeFile(
+				BUCKET_INDEX,
+				writeBucketIndex(objects.map(({ object }) => object)),
+			);
+			const files = [index.entry, ...objects.map(({ entry }) => entry)];
+			const meta = {
+				objects: objects.length,
+				bytes: objects.reduce((sum, { object }) => sum + object.size, 0),
+				read: read.length,
+				reused: kept.length,
+			};
+			const manifest = await repo.commit({ kind: "r2", name }, files, meta);
+			return {
+				source: name,
+				name: manifest.name,
+				created: manifest.created,
+				tables: 0,
+				rows: 0,
+				objects: objects.length,
+				size: files.reduce((sum, file) => sum + file.size, 0),
+				newBytes: read.reduce((sum, item) => sum + item.newBytes, index.stats.newBytes),
+				empty: [],
+			};
+		});
+	}
+
+	/**
+	 * Lists the bucket from where the last page ended. An object the last snapshot holds with the
+	 * same etag, size and upload time gets that snapshot's file, and isn't read again: R2 never
+	 * changes an object, only replaces it.
+	 */
+	async #listBucket(
+		source: R2Source,
+		from: ListFrom,
+	): Promise<{ objects: ListedObject[]; next?: ListFrom }> {
+		const bucket = this.#bucket(source);
+		const known = await this.#lastObjects(source);
+		const page = await bucket.list({
+			limit: LIST_OBJECTS,
+			include: ["httpMetadata", "customMetadata"],
+			...(from.cursor !== undefined ? { cursor: from.cursor } : {}),
+			...(from.after !== undefined ? { startAfter: from.after } : {}),
+		});
+		const objects: ListedObject[] = [];
+		let bytes = 0;
+		for (const found of page.objects) {
+			const object = describeObject(found);
+			const last = known.get(object.key);
+			const same =
+				last !== undefined &&
+				last.object.etag === object.etag &&
+				last.object.size === object.size &&
+				last.object.uploaded === object.uploaded;
+			const item: ListedObject = same ? { object, entry: last.entry } : { object };
+			const cost = JSON.stringify(item).length;
+			const previous = objects.at(-1);
+			if (previous && bytes + cost > LIST_BYTES) {
+				return { objects, next: { after: previous.object.key } };
+			}
+			objects.push(item);
+			bytes += cost;
+		}
+		return page.truncated ? { objects, next: { cursor: page.cursor } } : { objects };
+	}
+
+	/**
+	 * What the newest snapshot holds, by key. Empty when there is none, and when it doesn't open:
+	 * then every object is read again, and the snapshot this run makes doesn't lean on it.
+	 */
+	async #lastObjects(
+		source: R2Source,
+	): Promise<Map<string, { object: BucketObject; entry: FileEntry }>> {
+		const known = new Map<string, { object: BucketObject; entry: FileEntry }>();
+		const repo = await this.#repository(source);
+		const newest = (await repo.snapshots()).at(-1);
+		if (newest === undefined) return known;
+		try {
+			const manifest = await repo.manifest(newest);
+			const index = manifest.files.find((file) => file.path === BUCKET_INDEX);
+			if (manifest.source.kind !== "r2" || !index) return known;
+			const files = new Map(manifest.files.map((file) => [file.path, file]));
+			for (const object of readBucketIndex(await repo.readWholeFile(index))) {
+				const entry = files.get(bucketFile(object.key));
+				if (entry && entry.size === object.size) known.set(object.key, { object, entry });
+			}
+		} catch (error) {
+			const unreadable =
+				error instanceof RepositoryError ||
+				error instanceof SealError ||
+				error instanceof BucketIndexError ||
+				error instanceof SyntaxError;
+			if (!unreadable) throw error;
+			known.clear();
+		}
+		return known;
+	}
+
+	/** Reads some of the bucket's objects into the repository, each in its own file. */
+	async #readObjects(source: R2Source, keys: string[]): Promise<ReadObject[]> {
+		const bucket = this.#bucket(source);
+		const repo = await this.#repository(source);
+		const read: ReadObject[] = [];
+		for (const key of keys) {
+			const found = await bucket.get(key);
+			if (found === null) continue;
+			const { entry, stats } = await repo.writeFile(bucketFile(key), found.body);
+			if (entry.size !== found.size) {
+				throw new Error(`An object of ${found.size} bytes came back with ${entry.size}.`);
+			}
+			read.push({ object: describeObject(found), entry, newBytes: stats.newBytes });
+		}
+		return read;
+	}
+
+	/** The source's bucket, from its binding, which must not be the one backups go to. */
+	#bucket(source: R2Source): R2Bucket {
+		const binding = (this.env as unknown as Record<string, unknown>)[source.binding];
+		if (!isR2(binding)) {
+			throw new NonRetryableError(
+				`Source ${source.name}'s binding ${source.binding} isn't an R2 bucket.`,
+			);
+		}
+		if (source.binding === "VAULT") {
+			throw new NonRetryableError(`Source ${source.name} is the bucket backups go to.`);
+		}
+		return binding;
 	}
 
 	/** The app's Backup entrypoint, from the source's service binding. */

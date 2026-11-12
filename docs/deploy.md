@@ -81,11 +81,14 @@ which names objects and steps, never data.
 `RETENTION` keeps the newest snapshot, the newest of each of the last 7 days, 4 weeks and 12 months
 (`1l 7d 4w 12m`). [format.md](format.md#retention) says exactly how it counts.
 
+## Restoring
+
+[restore.md](restore.md): the CLI reads the bucket with a read-only R2 token and the key, and
+writes SQL for a new D1 database.
+
 ## What it can't do yet
 
 - Only D1 sources. Durable Objects, R2 and KV come next.
 - One copy, in R2. The copy at another provider comes next.
-- No restore command yet. Until there is one, a restore is `Repository.readWholeFile` and
-  `restoreSql` from `packages/core`, into a new database, never over the live one.
 - A database is read in one D1 batch, which must fit in one response. Very large databases will need
   a paged mode.

@@ -1,0 +1,9 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		// Node only: it reads files, signs S3 requests and opens SQLite with Node's own modules.
+		"lib": ["ES2024", "DOM"],
+		"types": ["node"]
+	},
+	"include": ["src"]
+}

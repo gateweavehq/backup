@@ -92,7 +92,16 @@ catalog, the lock and retention; the rest of this section is still to come where
   the same transaction crashed workerd when we tried it. `JURISDICTION` keeps the objects where the
   bucket is. An object runs one test at a time, since a step that timed out may be tried again
   while its first try is still running.
-- **Alerts (next):** a failed or late backup sends mail, opens a Track issue or calls a webhook.
+- **Alerts.** A run in which a backup or a restore test failed ends with an alert, and so does
+  one that asks for it (`"alert": true`). The Worker's own cron checks each morning, six hours after
+  the nightly run, that every source's newest backup started in the last 26 hours and hasn't been
+  going for over 5, and alerts if not: that catches the runs that never got far enough to send their
+  own. An alert goes by email through Email Service's binding and to a webhook signed as Standard
+  Webhooks signs one, whichever are set up. It is written to the catalog under its key
+  (`run:<instance>` or `late:<day>`) before it is sent and marked when it has gone, so a retried step
+  doesn't send it twice. One that can't be sent stays there with why, the run ends as it would have,
+  and the morning check tries it again for three days. Its text names sources, snapshots and steps,
+  never data, like the catalog's errors. Opening a Track issue can come through the webhook.
 - **MCP (next):** agents can list and check backups. A restore needs a person.
 
 ### CLI

@@ -15,10 +15,13 @@ import {
 	retain,
 	utf8,
 } from "@gateweave/backup-core";
+import { type Alert, AlertConfigError, runAlert, sendAlert } from "./alerts";
 import { d1Reader, isD1, R2Store } from "./bindings";
 import {
 	failRun,
 	finishRun,
+	markAlertFailed,
+	recordAlert,
 	recordSnapshot,
 	recordTest,
 	releaseLock,
@@ -35,6 +38,8 @@ export interface BackupParams {
 	sources?: string[];
 	/** Restore-test each new snapshot, whether or not a test is due. */
 	test?: boolean;
+	/** Send the run's alert even if nothing failed, to see that alerts arrive. */
+	alert?: boolean;
 }
 
 export interface SourceResult {
@@ -44,11 +49,19 @@ export interface SourceResult {
 	/** How the restore test of the new snapshot went, when there was one. */
 	test?: "passed" | "failed";
 	error?: string;
+	/** Why the restore test failed. */
+	testError?: string;
 }
 
 /** Catalog writes are small, and D1 hiccups pass. */
 const QUICK: WorkflowStepConfig = {
 	retries: { limit: 5, delay: "10 seconds", backoff: "exponential" },
+	timeout: "1 minute",
+};
+
+/** An alert waits out a mail or webhook hiccup of a few minutes, then gives up until the morning. */
+const ALERT: WorkflowStepConfig = {
+	retries: { limit: 4, delay: "30 seconds", backoff: "exponential" },
 	timeout: "1 minute",
 };
 
@@ -76,9 +89,35 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			...(failed.length > 0 ? [`The backup of ${failed.join(", ")} failed.`] : []),
 			...(untested.length > 0 ? [`The restore test of ${untested.join(", ")} failed.`] : []),
 		];
+		const asked = event.payload?.alert === true;
+		if (problems.length > 0 || asked) {
+			await this.#alert(runAlert(event.instanceId, results, asked), step);
+		}
 		// A run that made every snapshot but couldn't restore one shows as failed too.
 		if (problems.length > 0) throw new Error(`${problems.join(" ")} The catalog says why.`);
 		return results;
+	}
+
+	/**
+	 * Keeps the alert in the catalog, then sends it. One that can't be sent stays there with why,
+	 * and the next morning's check (alerts.ts) tries it again; the run goes on to end as it would.
+	 */
+	async #alert(alert: Alert, step: WorkflowStep) {
+		const db = this.env.CATALOG;
+		await step.do("alert", QUICK, () => recordAlert(db, alert, Date.now()));
+		try {
+			await step.do("alert: send", ALERT, () =>
+				sendAlert(this.env, alert).catch((error: unknown) => {
+					// A setting no retry fixes fails the step at once.
+					if (error instanceof AlertConfigError) throw new NonRetryableError(error.message);
+					throw error;
+				}),
+			);
+		} catch (error) {
+			await step.do("alert: not sent", QUICK, () =>
+				markAlertFailed(db, alert.key, describe(error)),
+			);
+		}
 	}
 
 	async #backUp(
@@ -111,7 +150,10 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				await finishRun(db, { id, source: name, at: Date.now(), ...pruned });
 				await releaseLock(db, name, instance);
 			});
-			return { source: name, status: "ok", snapshot, ...(test ? { test } : {}) };
+			const result: SourceResult = { source: name, status: "ok", snapshot };
+			if (test) result.test = test.passed ? "passed" : "failed";
+			if (test?.error) result.testError = test.error;
+			return result;
 		} catch (error) {
 			const reason = describe(error);
 			const message = snapshot ? `Snapshot ${snapshot} was made, but then: ${reason}` : reason;
@@ -133,7 +175,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 		snapshot: string,
 		step: WorkflowStep,
 		force: boolean,
-	): Promise<"passed" | "failed" | undefined> {
+	): Promise<RestoreTestResult | undefined> {
 		const db = this.env.CATALOG;
 		const failed = (error: string): RestoreTestResult => ({
 			source: name,
@@ -164,7 +206,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			result = failed(describe(error));
 		}
 		await step.do(`${name}: test recorded`, QUICK, () => recordTest(db, runId, result, Date.now()));
-		return result.passed ? "passed" : "failed";
+		return result;
 	}
 
 	/** Dumps the source and commits the dump as a snapshot. */

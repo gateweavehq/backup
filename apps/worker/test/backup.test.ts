@@ -1,4 +1,8 @@
-import { introspectWorkflowInstance, runInDurableObject } from "cloudflare:test";
+import {
+	createScheduledController,
+	introspectWorkflowInstance,
+	runInDurableObject,
+} from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import {
 	dumpSqlite,
@@ -11,6 +15,8 @@ import {
 	utf8,
 } from "@gateweave/backup-core";
 import { beforeEach, describe, expect, it } from "vitest";
+import worker from "../src";
+import { type Alert, checkBackups, deliver, destinationsOf } from "../src/alerts";
 import { d1Reader, R2Store } from "../src/bindings";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
@@ -43,6 +49,7 @@ beforeEach(async () => {
 		env.CATALOG.prepare("DELETE FROM snapshot"),
 		env.CATALOG.prepare("DELETE FROM lock"),
 		env.CATALOG.prepare("DELETE FROM restore_test"),
+		env.CATALOG.prepare("DELETE FROM alert"),
 	]);
 	const listed = await env.VAULT.list();
 	if (listed.objects.length > 0) await env.VAULT.delete(listed.objects.map((o) => o.key));
@@ -100,6 +107,10 @@ async function runs() {
 	return (await env.CATALOG.prepare("SELECT * FROM run ORDER BY started_at, id").all()).results;
 }
 
+async function alerts() {
+	return (await env.CATALOG.prepare("SELECT * FROM alert ORDER BY made_at, key").all()).results;
+}
+
 describe("a backup run", () => {
 	it("makes a snapshot that restores to the same rows", async () => {
 		const result = await backUp("first", { sources: ["app"] });
@@ -114,6 +125,8 @@ describe("a backup run", () => {
 				},
 			],
 		});
+
+		expect(await alerts()).toEqual([]);
 
 		const repo = await repository();
 		const [name] = await repo.snapshots();
@@ -224,6 +237,26 @@ describe("a backup run", () => {
 			error: "Source broken's binding VAULT isn't a D1 database.",
 		});
 		expect(await (await repository()).snapshots()).toHaveLength(1);
+
+		// With nowhere to send it set up, the alert is kept, and noted as gone nowhere.
+		const [alert] = await alerts();
+		expect(alert).toEqual({
+			key: "run:all",
+			made_at: expect.any(Number),
+			subject: "Gateweave Backup: the backup of broken failed",
+			text: expect.any(String),
+			sent_to: "",
+			sent_at: expect.any(Number),
+			error: null,
+		});
+		expect(String(alert?.text).split("\n")).toEqual([
+			"Backup run all:",
+			"",
+			expect.stringMatching(/^- app: snapshot \d{8}T\S+ made, and its restore test passed\.$/),
+			"- broken: the backup failed. Source broken's binding VAULT isn't a D1 database.",
+			"",
+			"The catalog has more: its run and restore_test tables, under all/<source>.",
+		]);
 	});
 
 	it("fails a repository the key doesn't open, and leaves it as it was", async () => {
@@ -397,6 +430,15 @@ describe("restore tests", () => {
 		]);
 		expect((await env.CATALOG.prepare("SELECT * FROM lock").all()).results).toEqual([]);
 		expect(await (await repository()).snapshots()).toHaveLength(1);
+		expect(await alerts()).toEqual([
+			expect.objectContaining({
+				key: "run:unlucky",
+				subject: "Gateweave Backup: the restore test of app failed",
+				text: expect.stringContaining(
+					"made, but its restore test failed. Chunk abc of database.jsonl is missing.\n",
+				),
+			}),
+		]);
 
 		// A failed test is due again the next night.
 		expect((await backUp("next-night", { sources: ["app"] })).output).toEqual([
@@ -491,6 +533,215 @@ describe("restore tests", () => {
 		for (const bad of ["0", "1.5", "a week", "400"]) {
 			expect(() => testInterval(bad), bad).toThrow("RESTORE_TEST_DAYS must be");
 		}
+	});
+});
+
+describe("alerts", () => {
+	const HOUR = 60 * 60 * 1000;
+	const ALERT: Alert = { key: "run:x", subject: "Gateweave Backup: a test", text: "One\nTwo" };
+	/** A webhook secret for these tests only: 32 bytes, "gateweave backup alert tests 01!". */
+	const SECRET = "whsec_Z2F0ZXdlYXZlIGJhY2t1cCBhbGVydCB0ZXN0cyAwMSE=";
+
+	/** An EMAIL binding that keeps what it was given, or fails as Email Service does. */
+	function mailbox(error?: Error & { code?: string }) {
+		const sent: unknown[] = [];
+		const binding = {
+			async send(message: unknown) {
+				if (error) throw error;
+				sent.push(message);
+				return { messageId: "test" };
+			},
+		} as unknown as SendEmail;
+		return { binding, sent };
+	}
+
+	async function startedRun(source: string, ago: number, status: "running" | "ok") {
+		const at = Date.now() - ago;
+		await env.CATALOG.prepare(
+			"INSERT INTO run (id, instance, source, started_at, status) VALUES (?1, ?1, ?2, ?3, ?4)",
+		)
+			.bind(`${source}-${at}`, source, at, status)
+			.run();
+	}
+
+	it("go by email and by a webhook signed as Standard Webhooks signs one", async () => {
+		const { binding, sent } = mailbox();
+		const destinations = destinationsOf({
+			ALERT_FROM: "Gateweave Backup <backup@example.com>",
+			ALERT_TO: " owner@example.com, second@example.org ",
+			ALERT_WEBHOOK_URL: "https://hooks.example/backup",
+			ALERT_WEBHOOK_SECRET: SECRET,
+			EMAIL: binding,
+		});
+		const requests: Request[] = [];
+		const at = new Date("2026-11-12T09:17:00Z");
+		const went = await deliver(ALERT, destinations, at, async (input, init) => {
+			requests.push(new Request(input, init));
+			return new Response(null, { status: 204 });
+		});
+
+		expect(went).toEqual(["email", "webhook"]);
+		expect(sent).toEqual([
+			{
+				from: { name: "Gateweave Backup", email: "backup@example.com" },
+				to: ["owner@example.com", "second@example.org"],
+				subject: ALERT.subject,
+				text: ALERT.text,
+			},
+		]);
+		const [request] = requests;
+		if (!request) throw new Error("The webhook wasn't called.");
+		expect(request.url).toBe("https://hooks.example/backup");
+		const body = await request.text();
+		expect(JSON.parse(body)).toEqual({
+			type: "backup.alert",
+			timestamp: "2026-11-12T09:17:00.000Z",
+			data: { key: "run:x", subject: ALERT.subject, text: ALERT.text },
+		});
+		const id = request.headers.get("webhook-id");
+		const timestamp = request.headers.get("webhook-timestamp");
+		expect(id).toMatch(/^msg_[A-Za-z0-9_-]+$/);
+		expect(timestamp).toBe(String(at.getTime() / 1000));
+		// Checked as a receiver would, from the secret alone.
+		const raw = Uint8Array.from(atob(SECRET.slice("whsec_".length)), (c) => c.charCodeAt(0));
+		const key = await crypto.subtle.importKey(
+			"raw",
+			raw,
+			{ name: "HMAC", hash: "SHA-256" },
+			false,
+			["verify"],
+		);
+		const signature = request.headers.get("webhook-signature") ?? "";
+		expect(signature).toMatch(/^v1,/);
+		const mac = Uint8Array.from(atob(signature.slice(3)), (c) => c.charCodeAt(0));
+		const signed = new TextEncoder().encode(`${id}.${timestamp}.${body}`);
+		expect(await crypto.subtle.verify("HMAC", key, mac, signed)).toBe(true);
+	});
+
+	it("go nowhere when nothing is set up, and refuse a setting that is there but wrong", () => {
+		expect(destinationsOf({})).toEqual({});
+		expect(destinationsOf({ ALERT_FROM: " ", ALERT_TO: "" })).toEqual({});
+		const { binding } = mailbox();
+		const wrong: [Parameters<typeof destinationsOf>[0], string][] = [
+			[{ ALERT_FROM: "backup@example.com", EMAIL: binding }, "need both ALERT_FROM and ALERT_TO"],
+			[{ ALERT_TO: "owner@example.com", EMAIL: binding }, "need both ALERT_FROM and ALERT_TO"],
+			[
+				{ ALERT_FROM: "backup@example.com", ALERT_TO: "owner@example.com" },
+				"need the EMAIL binding",
+			],
+			[
+				{ ALERT_FROM: "Backup <nobody>", ALERT_TO: "owner@example.com", EMAIL: binding },
+				"ALERT_FROM isn't an email address",
+			],
+			[
+				{ ALERT_FROM: "backup@example.com", ALERT_TO: "owner; boss@example.com", EMAIL: binding },
+				"ALERT_TO must be email addresses",
+			],
+			[{ ALERT_WEBHOOK_URL: "hooks.example" }, "ALERT_WEBHOOK_URL isn't a URL"],
+			[
+				{ ALERT_WEBHOOK_URL: "http://hooks.example/", ALERT_WEBHOOK_SECRET: SECRET },
+				"must be https",
+			],
+			[{ ALERT_WEBHOOK_URL: "https://hooks.example/" }, "ALERT_WEBHOOK_SECRET must be"],
+			[
+				{ ALERT_WEBHOOK_URL: "https://hooks.example/", ALERT_WEBHOOK_SECRET: "whsec_c2hvcnQ=" },
+				"ALERT_WEBHOOK_SECRET must be",
+			],
+		];
+		for (const [settings, message] of wrong) {
+			expect(() => destinationsOf(settings), JSON.stringify(settings)).toThrow(message);
+		}
+	});
+
+	it("say what Email Service and the webhook answered, and never an address", async () => {
+		const refused = Object.assign(new Error("owner@example.com is suppressed"), {
+			code: "E_RECIPIENT_SUPPRESSED",
+		});
+		const settings = { ALERT_FROM: "backup@example.com", ALERT_TO: "owner@example.com" };
+		const email = destinationsOf({ ...settings, EMAIL: mailbox(refused).binding });
+		await expect(deliver(ALERT, email, new Date())).rejects.toThrow(
+			/^The alert email wasn't sent: E_RECIPIENT_SUPPRESSED\.$/,
+		);
+		const hook = destinationsOf({
+			ALERT_WEBHOOK_URL: "https://hooks.example/",
+			ALERT_WEBHOOK_SECRET: SECRET,
+		});
+		const status = (code: number) => async () => new Response(null, { status: code });
+		await expect(deliver(ALERT, hook, new Date(), status(500))).rejects.toThrow(
+			"The alert webhook answered 500.",
+		);
+		const offline = async () => Promise.reject(new TypeError("Network connection lost."));
+		await expect(deliver(ALERT, hook, new Date(), offline)).rejects.toThrow(
+			"The alert webhook answered nothing.",
+		);
+	});
+
+	it("go out when a run asks for one, though nothing failed", async () => {
+		const result = await backUp("asked-for", { sources: ["app"], alert: true });
+		expect(result.ended).toBe("complete");
+		expect(await alerts()).toEqual([
+			expect.objectContaining({
+				key: "run:asked-for",
+				subject: "Gateweave Backup: every backup was made (a test alert)",
+				sent_to: "",
+			}),
+		]);
+	});
+
+	it("that can't be sent stay in the catalog and go the next morning", async () => {
+		const result = await backUp("unsent", { sources: ["app"], alert: true }, (m) =>
+			m.mockStepError({ name: "alert: send" }, new Error("The alert webhook answered 503.")),
+		);
+		expect(result.ended).toBe("complete");
+		expect(await alerts()).toEqual([
+			expect.objectContaining({
+				key: "run:unsent",
+				sent_at: null,
+				error: "The alert webhook answered 503.",
+			}),
+		]);
+
+		await startedRun("broken", HOUR, "ok");
+		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 1 });
+		expect(await alerts()).toEqual([
+			expect.objectContaining({ key: "run:unsent", sent_to: "", error: null }),
+		]);
+	});
+
+	it("say when a nightly backup didn't start, or didn't end", async () => {
+		await startedRun("app", 30 * HOUR, "ok");
+		await startedRun("broken", 6 * HOUR, "running");
+		const controller = createScheduledController({ scheduledTime: Date.now(), cron: "17 9 * * *" });
+		await worker.scheduled(controller, env);
+
+		const [late] = await alerts();
+		const day = new Date().toISOString().slice(0, 10);
+		expect(late).toMatchObject({
+			key: `late:${day}`,
+			subject: "Gateweave Backup: backups are late",
+			sent_to: "",
+		});
+		expect(String(late?.text).split("\n")).toEqual([
+			`On ${day}:`,
+			"",
+			expect.stringMatching(/^- app: no backup has started since \d{4}-\d\d-\d\dT.+Z\.$/),
+			expect.stringMatching(/^- broken: the backup that started .+Z hasn't ended\.$/),
+			"",
+			"The nightly run didn't start, or stopped part way. The Workflow's instances say which.",
+		]);
+
+		// Once a day, however often the check runs.
+		expect(await checkBackups(env, Date.now())).toEqual({ late: true, sent: 0 });
+		expect(await alerts()).toHaveLength(1);
+	});
+
+	it("stay quiet while every source's backup is on time", async () => {
+		await startedRun("app", 6 * HOUR, "ok");
+		// A run cut off long ago is past, once a newer one ran.
+		await startedRun("broken", 50 * HOUR, "running");
+		await startedRun("broken", 2 * HOUR, "running");
+		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 0 });
+		expect(await alerts()).toEqual([]);
 	});
 });
 

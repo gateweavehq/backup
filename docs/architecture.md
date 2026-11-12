@@ -67,9 +67,9 @@ the same account.
 
 ### Worker
 
-[deploy.md](deploy.md) says how to set it up. Today it backs up D1, and an app's Durable Objects
-through its `Backup` entrypoint, into one R2 bucket, with the catalog, the lock and retention; the
-rest of this section is still to come where it says so.
+[deploy.md](deploy.md) says how to set it up. Today it backs up D1, an app's Durable Objects
+through its `Backup` entrypoint, and R2 buckets, into one R2 bucket, with the catalog, the lock and
+retention; the rest of this section is still to come where it says so.
 
 - **Runs in the owner's own Cloudflare account,** through the Deploy button, so the data and the
   key never pass through Gateweave. A hosted version would hold a token for every customer's
@@ -87,6 +87,14 @@ rest of this section is still to come where it says so.
   `objects/<name>.jsonl`. One deleted after the list was made is left out. Each dump is one
   moment of its object, read as SQLite dumps are; the snapshot isn't one moment across objects,
   which each stand alone.
+- **A bucket makes one snapshot too.** A step lists up to 1,000 objects, with their HTTP and custom
+  metadata, and stops short of half a megabyte, since a step's answer is kept and has a limit; the
+  next goes on from the last key or R2's cursor. An object the newest snapshot holds with the same
+  etag, size and upload time keeps that snapshot's file and isn't read: R2 never changes an object,
+  only replaces it, so those three tell a new one. The rest are read 100 objects or 256 MB to a
+  step, streamed into chunks, each at `files/<key>`, and the commit adds `bucket.json`, which lists
+  every object with its metadata. One deleted after it was listed is left out. A newest snapshot
+  that doesn't open is no help, so then every object is read again.
 - **Cloudflare Workflows** run each backup, one source after another: start, lock, back up, record,
   prune, test when due, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
@@ -105,7 +113,9 @@ rest of this section is still to come where it says so.
   night. A Durable Object, one per source, reads every file back and checks it, makes the dump's
   tables in its own SQLite, loads the rows in one transaction, checks foreign keys, counts every
   table against the dump, and rolls the rows back. A snapshot of an app's objects is tested a dump
-  at a time, each into an empty database. It runs after the prune and under the lock, so
+  at a time, each into an empty database. A bucket's has no dump: each object's file is read
+  through, a chunk at a time, and checked, and `bucket.json` must list exactly the files there are,
+  at their sizes. It runs after the prune and under the lock, so
   it also proves the prune kept what the snapshot needs. A failed test fails the run but keeps the
   backup, and the catalog says why.
 - **A restore test keeps no copy.** Only the empty tables are ever committed, and they are deleted

@@ -100,6 +100,21 @@ digits, dots, dashes and underscores, starting with a letter or digit, so it is 
 name. Its `meta` counts them all: `{"objects": 3, "tables": 69, "rows": 1840, "empty": []}`, where
 `empty` names a contentless table as `<object>/<table>`.
 
+An R2 bucket's snapshot (`"kind": "r2"`) keeps each object's bytes at `files/<key>`, under its key
+as it is, and lists the objects in `bucket.json`: a head line, then one object a line, in key
+order, with what R2 keeps beside the bytes, so a restore can put it back as it was:
+
+```json
+{"format":"r2-bucket","version":1,"objects":2}
+{"key":"w1/a.png","size":5120,"etag":"<etag>","uploaded":"2026-11-12T10:00:00.000Z","http":{"contentType":"image/png"},"custom":{"uploadedBy":"<id>"}}
+{"key":"w1/b.pdf","size":90210,"etag":"<etag>","uploaded":"2026-11-12T11:00:00.000Z","http":{"contentType":"application/pdf","cacheExpiry":"2027-01-01T00:00:00.000Z"},"custom":{}}
+```
+
+`http` has any of `contentType`, `contentLanguage`, `contentDisposition`, `contentEncoding`,
+`cacheControl` and `cacheExpiry`. Its `meta` counts them: `{"objects": 2, "bytes": 95330, "read":
+1, "reused": 1}`, where `read` objects were read this time and `reused` ones kept the file the
+snapshot before had for them.
+
 A dump that couldn't be read at one moment, because its database kept changing while it was read a
 page at a time, says so in its head line, and the `meta` says so too: `"consistent": false` for a
 single database, or `"inconsistent"` with the names of such objects. Neither appears otherwise.

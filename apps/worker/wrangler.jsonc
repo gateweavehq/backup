@@ -53,10 +53,12 @@
 	// "send_email": [{ "name": "EMAIL", "allowed_sender_addresses": ["backup@example.com"] }],
 	"vars": {
 		// What to back up. Each D1 source needs a binding of its own in `d1_databases`, an app's
-		// Durable Objects a service binding to its Backup entrypoint in `services`, and each a name
-		// that never changes: it is the repository's folder in the bucket. For example:
+		// Durable Objects a service binding to its Backup entrypoint in `services`, an R2 bucket a
+		// binding in `r2_buckets`, and each a name that never changes: it is the repository's folder
+		// in the bucket. For example:
 		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
-		//  { "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }]
+		//  { "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
+		//  { "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }]
 		"SOURCES": [],
 		// The newest snapshot, then one a day for 7 days, a week for 4 weeks, a month for 12 months.
 		"RETENTION": "1l 7d 4w 12m",
@@ -107,7 +109,9 @@
 				}
 			],
 			"r2_buckets": [
-				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" }
+				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" },
+				// Files attached in Track, a source: read, never written.
+				{ "binding": "TRACK_FILES", "bucket_name": "gateweave-track-files" }
 			],
 			// Track's workspaces, and Agents' registries and conversations, each in a Durable Object,
 			// through the apps' Backup entrypoints.
@@ -136,7 +140,8 @@
 					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
 					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" },
 					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
-					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" }
+					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" },
+					{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }
 				],
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",

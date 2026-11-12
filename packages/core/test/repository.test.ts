@@ -194,6 +194,36 @@ describe("a repository", () => {
 		]);
 	});
 
+	it("sorts a snapshot after one pushed ahead, though a second before it was freed", async () => {
+		const { repo } = await fresh();
+		const { entry } = await repo.writeFile("f", utf8("x"));
+		const at = new Date("2026-11-11T20:05:00.100Z");
+		const first = await repo.commit({ kind: "d1", name: "db" }, [entry], {}, at);
+		const pushed = await repo.commit({ kind: "d1", name: "db" }, [entry], {}, at);
+		await repo.forget(first.name);
+		const next = await repo.commit({ kind: "d1", name: "db" }, [entry], {}, at);
+		expect(next.name.slice(0, 16)).toBe("20261111T200502Z");
+		expect(await repo.snapshots()).toEqual([pushed.name, next.name]);
+	});
+
+	it("checks a file through, a chunk at a time, and finds one changed", async () => {
+		const { repo, store } = await fresh();
+		const bytes = new Uint8Array(200_000);
+		for (let i = 0; i < bytes.length; i++) bytes[i] = (i * 7919) % 251;
+		const { entry } = await repo.writeFile("f", bytes);
+		await expect(repo.checkFile(entry)).resolves.toBeUndefined();
+		await expect(repo.checkFile({ ...entry, size: entry.size + 1 })).rejects.toThrow(
+			"f doesn't match its manifest.",
+		);
+		await expect(repo.checkFile({ ...entry, sha256: "0".repeat(64) })).rejects.toThrow(
+			"f doesn't match its manifest.",
+		);
+		const [id] = entry.chunks;
+		if (!id) throw new Error("no chunk");
+		store.objects.delete(`data/${id.slice(0, 2)}/${id}`);
+		await expect(repo.checkFile(entry)).rejects.toThrow(`Chunk ${id} of f is missing.`);
+	});
+
 	it("keeps config.json readable, with nothing secret in it", async () => {
 		const { store, key } = await fresh();
 		const config = JSON.parse(fromUtf8(store.objects.get("config.json") ?? new Uint8Array()));

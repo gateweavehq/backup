@@ -1,14 +1,19 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+	BUCKET_INDEX,
+	BucketIndexError,
+	bucketFile,
 	DumpError,
 	DumpLines,
 	type DumpSummary,
 	describeStatement,
 	ident,
 	isDumpFile,
+	type Manifest,
 	objectOf,
 	Repository,
 	RepositoryError,
+	readBucketIndex,
 	restoreSql,
 	SealError,
 	summarizeDump,
@@ -20,9 +25,10 @@ export interface RestoreTestResult {
 	source: string;
 	snapshot: string;
 	passed: boolean;
-	/** What came back: tables and rows. */
+	/** What came back: tables and rows, and how many objects, for a source of many. */
 	tables: number;
 	rows: number;
+	objects?: number;
 	/** The bytes read back and checked. */
 	size: number;
 	/** Why it failed. It names objects and statements, never values. */
@@ -88,7 +94,8 @@ export class RestoreTest extends DurableObject<Env> {
 
 	/**
 	 * Reads the snapshot back, checks every file, and restores each dump: a D1 source's one, or each
-	 * of an app's objects, one after another, each into an empty database.
+	 * of an app's objects, one after another, each into an empty database. A bucket's snapshot has no
+	 * dump: every object's file is read through and checked, and so is bucket.json's list of them.
 	 */
 	async #test(source: string, snapshot: string, result: RestoreTestResult): Promise<void> {
 		const store = new R2Store(this.env.VAULT, `${source}/`);
@@ -99,7 +106,7 @@ export class RestoreTest extends DurableObject<Env> {
 		for (const entry of manifest.files) {
 			// Every file is read whole and checked against its size and hash; a dump is also restored.
 			if (!isDumpFile(entry.path)) {
-				await repo.readWholeFile(entry);
+				await repo.checkFile(entry);
 				result.size += entry.size;
 				continue;
 			}
@@ -120,11 +127,18 @@ export class RestoreTest extends DurableObject<Env> {
 				throw new RestoreFailure(`${objectOf(entry.path) ?? entry.path}: ${error.message}`);
 			}
 		}
+		const objects =
+			manifest.source.kind === "r2"
+				? await checkBucket(repo, manifest)
+				: manifest.source.kind === "do"
+					? loaded
+					: undefined;
 		const meant = manifest.meta.rows;
 		if (typeof meant === "number" && meant !== result.rows) {
 			const held = many ? "the dumps hold" : "the dump holds";
 			throw new RestoreFailure(`The manifest says ${meant} rows; ${held} ${result.rows}.`);
 		}
+		if (objects !== undefined) result.objects = objects;
 		result.passed = true;
 	}
 
@@ -190,10 +204,42 @@ export class RestoreTest extends DurableObject<Env> {
 	}
 }
 
+/**
+ * Checks that a bucket's snapshot holds a file for every object bucket.json lists, of its size, and
+ * nothing else. Answers how many objects it holds.
+ */
+async function checkBucket(repo: Repository, manifest: Manifest): Promise<number> {
+	const index = manifest.files.find((entry) => entry.path === BUCKET_INDEX);
+	if (!index) throw new RestoreFailure("The snapshot has no bucket.json.");
+	const objects = readBucketIndex(await repo.readWholeFile(index));
+	const files = new Map(manifest.files.map((entry) => [entry.path, entry]));
+	for (const object of objects) {
+		const file = files.get(bucketFile(object.key));
+		if (!file || file.size !== object.size) {
+			throw new RestoreFailure(
+				`bucket.json lists an object of ${object.size} bytes that the snapshot doesn't hold.`,
+			);
+		}
+	}
+	if (manifest.files.length !== objects.length + 1) {
+		throw new RestoreFailure(
+			`The snapshot holds ${manifest.files.length - 1} objects' files; bucket.json lists ${objects.length}.`,
+		);
+	}
+	const meant = manifest.meta.objects;
+	if (typeof meant === "number" && meant !== objects.length) {
+		throw new RestoreFailure(
+			`The manifest says ${meant} objects; bucket.json lists ${objects.length}.`,
+		);
+	}
+	return objects.length;
+}
+
 /** Whether an error says the snapshot doesn't restore, rather than that reading it failed for now. */
 function isFailure(error: unknown): error is Error {
 	return (
 		error instanceof RestoreFailure ||
+		error instanceof BucketIndexError ||
 		error instanceof DumpError ||
 		error instanceof RepositoryError ||
 		error instanceof SealError

@@ -52,6 +52,8 @@ export interface SnapshotRecord {
 	created: string;
 	tables: number;
 	rows: number;
+	/** How many objects it holds: an app's Durable Objects, or a bucket's. */
+	objects?: number;
 	size: number;
 	newBytes: number;
 	empty: string[];
@@ -65,8 +67,8 @@ export async function recordSnapshot(
 	await db.batch([
 		db
 			.prepare(
-				`INSERT INTO snapshot (source, name, created_at, table_count, row_count, size, empty)
-				VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (source, name) DO NOTHING`,
+				`INSERT INTO snapshot (source, name, created_at, table_count, row_count, object_count, size,
+				empty) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT (source, name) DO NOTHING`,
 			)
 			.bind(
 				snapshot.source,
@@ -74,15 +76,24 @@ export async function recordSnapshot(
 				Date.parse(snapshot.created),
 				snapshot.tables,
 				snapshot.rows,
+				snapshot.objects ?? null,
 				snapshot.size,
 				JSON.stringify(snapshot.empty),
 			),
 		db
 			.prepare(
-				`UPDATE run SET snapshot = ?2, table_count = ?3, row_count = ?4, size = ?5, new_bytes = ?6
-				WHERE id = ?1`,
+				`UPDATE run SET snapshot = ?2, table_count = ?3, row_count = ?4, object_count = ?5,
+				size = ?6, new_bytes = ?7 WHERE id = ?1`,
 			)
-			.bind(runId, snapshot.name, snapshot.tables, snapshot.rows, snapshot.size, snapshot.newBytes),
+			.bind(
+				runId,
+				snapshot.name,
+				snapshot.tables,
+				snapshot.rows,
+				snapshot.objects ?? null,
+				snapshot.size,
+				snapshot.newBytes,
+			),
 	]);
 }
 
@@ -158,7 +169,8 @@ export async function recordTest(
 	await db
 		.prepare(
 			`INSERT INTO restore_test (run, source, snapshot, tested_at, status, table_count, row_count,
-				size, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (run) DO NOTHING`,
+				object_count, size, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+				ON CONFLICT (run) DO NOTHING`,
 		)
 		.bind(
 			runId,
@@ -168,6 +180,7 @@ export async function recordTest(
 			test.passed ? "passed" : "failed",
 			test.tables,
 			test.rows,
+			test.objects ?? null,
 			test.size,
 			test.error?.slice(0, ERROR_LENGTH) ?? null,
 		)

@@ -223,18 +223,15 @@ export async function unsentAlerts(db: D1Database, since: number): Promise<Alert
 	return results;
 }
 
-/** When the source's newest run started, or null if none has. */
-export async function lastStart(db: D1Database, source: string): Promise<number | null> {
+/** The source's newest run: when it started and how it stands. Null if it has none. */
+export async function newestRun(
+	db: D1Database,
+	source: string,
+): Promise<{ startedAt: number; status: "running" | "ok" | "failed" } | null> {
 	return db
-		.prepare("SELECT max(started_at) AS at FROM run WHERE source = ?1")
+		.prepare(
+			"SELECT started_at AS startedAt, status FROM run WHERE source = ?1 ORDER BY started_at DESC, id DESC LIMIT 1",
+		)
 		.bind(source)
-		.first<number | null>("at");
-}
-
-/** When the source's oldest run that is still going started, or null if none is. */
-export async function oldestRunning(db: D1Database, source: string): Promise<number | null> {
-	return db
-		.prepare("SELECT min(started_at) AS at FROM run WHERE source = ?1 AND status = 'running'")
-		.bind(source)
-		.first<number | null>("at");
+		.first();
 }

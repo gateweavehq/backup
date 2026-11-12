@@ -737,6 +737,8 @@ describe("alerts", () => {
 
 	it("stay quiet while every source's backup is on time", async () => {
 		await startedRun("app", 6 * HOUR, "ok");
+		// A run cut off long ago is past, once a newer one ran.
+		await startedRun("broken", 50 * HOUR, "running");
 		await startedRun("broken", 2 * HOUR, "running");
 		expect(await checkBackups(env, Date.now())).toEqual({ late: false, sent: 0 });
 		expect(await alerts()).toEqual([]);

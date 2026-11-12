@@ -1,10 +1,9 @@
 import { toBase64Url } from "@gateweave/backup-core";
 import {
 	alertSent,
-	lastStart,
 	markAlertFailed,
 	markAlertSent,
-	oldestRunning,
+	newestRun,
 	recordAlert,
 	unsentAlerts,
 } from "./catalog";
@@ -235,27 +234,27 @@ const HOUR_MS = 60 * 60 * 1000;
 /** A nightly backup that hasn't started for this long didn't happen. */
 const LATE_MS = 26 * HOUR_MS;
 
-/** A run still going after this long has stopped somewhere without saying so. */
+/**
+ * A run still going after this long has stopped somewhere without saying so. Only a source's newest
+ * run counts: an older one left "running" by a run that was cut off is past, once a newer one ran.
+ */
 const STUCK_MS = 5 * HOUR_MS;
 
 /**
- * The alert for backups that didn't happen: a source whose last run started over LATE_MS ago, or
- * never, or one with a run going for over STUCK_MS. A run that fails sends its own alert; this
+ * The alert for backups that didn't happen: a source whose newest run started over LATE_MS ago,
+ * or that has none, or whose newest run has been going for over STUCK_MS. A run that fails sends its own alert; this
  * catches the runs that never got that far. Undefined when every source is on time.
  */
 export async function lateAlert(env: Env, now: number): Promise<Alert | undefined> {
 	const lines: string[] = [];
 	for (const { name } of parseSources(env.SOURCES)) {
-		const last = await lastStart(env.CATALOG, name);
-		if (last === null) lines.push(`- ${name}: no backup has started yet.`);
-		else if (last < now - LATE_MS) {
-			lines.push(`- ${name}: no backup has started since ${new Date(last).toISOString()}.`);
-		}
-		const stuck = await oldestRunning(env.CATALOG, name);
-		if (stuck !== null && stuck < now - STUCK_MS) {
-			lines.push(
-				`- ${name}: the backup that started ${new Date(stuck).toISOString()} hasn't ended.`,
-			);
+		const run = await newestRun(env.CATALOG, name);
+		const started = run ? new Date(run.startedAt).toISOString() : "";
+		if (!run) lines.push(`- ${name}: no backup has started yet.`);
+		else if (run.status === "running" && run.startedAt < now - STUCK_MS) {
+			lines.push(`- ${name}: the backup that started ${started} hasn't ended.`);
+		} else if (run.startedAt < now - LATE_MS) {
+			lines.push(`- ${name}: no backup has started since ${started}.`);
 		}
 	}
 	if (lines.length === 0) return undefined;

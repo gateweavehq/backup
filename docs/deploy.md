@@ -97,8 +97,8 @@ A failed test fails the run, but the backup it tested stays.
 ## Alerts
 
 A run in which a backup or a restore test failed sends an alert, and so does the daily check
-(`triggers` in `wrangler.jsonc`, at 09:17 UTC) when a source's backup didn't start in the last 26
-hours or hasn't ended after 5. The check counts on backups running every night. Every alert is kept
+(`triggers` in `wrangler.jsonc`, at 09:17 UTC) when a source's newest backup started over 26 hours
+ago, or hasn't ended after 5. The check counts on backups running every night. Every alert is kept
 in the catalog's `alert` table, sent or not; set up where they go, by email, by webhook or both.
 
 **Email** needs [Email Service](https://developers.cloudflare.com/email-service/) sending from a

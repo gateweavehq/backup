@@ -94,7 +94,7 @@ catalog, the lock and retention; the rest of this section is still to come where
   while its first try is still running.
 - **Alerts.** A run in which a backup or a restore test failed ends with an alert, and so does
   one that asks for it (`"alert": true`). The Worker's own cron checks each morning, six hours after
-  the nightly run, that every source's backup started in the last 26 hours and that none has been
+  the nightly run, that every source's newest backup started in the last 26 hours and hasn't been
   going for over 5, and alerts if not: that catches the runs that never got far enough to send their
   own. An alert goes by email through Email Service's binding and to a webhook signed as Standard
   Webhooks signs one, whichever are set up. It is written to the catalog under its key

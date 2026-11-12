@@ -166,9 +166,11 @@ writes SQL for a new D1 database.
 ## What it can't do yet
 
 - D1 and an app's Durable Objects only. R2 and KV come next.
-- An object is read in one call, which must fit in one response, as a D1 batch must.
 - One copy, in R2. The copy at another provider comes next.
-- A database is read in one D1 batch, which must fit in one response. Very large databases will need
-  a paged mode.
-- A restore test holds the whole dump in memory a few times over while it loads, in a Durable
-  Object's 128 MB. Dumps over about 20 MB will need a streamed test.
+- A database whose rows come to more than 12 million characters is read a page at a time (see
+  [Core](architecture.md#core)). One that changes during each of three tries is kept anyway, and
+  says it wasn't read at one moment. A table that large without a rowid (`WITHOUT ROWID`) can't be
+  read a page at a time, and its backup fails.
+- A restore test holds the dump in memory once, as it was stored, while it loads. On Cloudflare a
+  test of a 160 MB dump passed and one of 240 MB ran out of the Durable Object's memory (measured
+  2026-11-12), so larger databases will need a test that restores them in parts.

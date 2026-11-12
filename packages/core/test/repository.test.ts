@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fromUtf8, utf8 } from "../src/bytes";
+import { concat, fromUtf8, Sha256, sha256Hex, utf8 } from "../src/bytes";
 import type { ChunkerParams } from "../src/cdc";
 import { generateMasterKey } from "../src/keys";
 import { Repository, RepositoryError, snapshotName } from "../src/repository";
@@ -92,6 +92,38 @@ describe("a repository", () => {
 		expect(await repo.readWholeFile(entry)).toEqual(data);
 		const whole = await repo.writeFile("again.jsonl", data);
 		expect(whole.entry.chunks).toEqual(entry.chunks);
+	});
+
+	it("gives back a file as its chunks, checked as a whole file is", async () => {
+		const { repo } = await fresh();
+		const data = text(100_000);
+		const { entry } = await repo.writeFile("database.jsonl", data);
+		const chunks = await repo.readFileChunks(entry);
+		expect(chunks.length).toBe(entry.chunks.length);
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(concat(...chunks)).toEqual(data);
+
+		const wrongHash = {
+			...entry,
+			sha256: entry.sha256.replace(/^./, (c) => (c === "0" ? "1" : "0")),
+		};
+		await expect(repo.readFileChunks(wrongHash)).rejects.toThrow(
+			"database.jsonl doesn't match its manifest.",
+		);
+		await expect(repo.readFileChunks({ ...entry, size: entry.size + 1 })).rejects.toThrow(
+			"database.jsonl doesn't match its manifest.",
+		);
+		await expect(repo.readFileChunks({ ...entry, size: entry.size - 1 })).rejects.toThrow(
+			"database.jsonl is longer than its manifest says.",
+		);
+	});
+
+	it("hashes a file in pieces as it would whole", async () => {
+		const data = text(50_000);
+		const hash = new Sha256();
+		for (let at = 0; at < data.length; at += 7_000)
+			await hash.update(data.subarray(at, at + 7_000));
+		expect(await hash.digest()).toBe(await sha256Hex(data));
 	});
 
 	it("notices a missing or damaged chunk", async () => {

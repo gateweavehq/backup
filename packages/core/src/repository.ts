@@ -1,4 +1,13 @@
-import { fromBase64Url, fromHex, fromUtf8, sha256Hex, toBase64Url, toHex, utf8 } from "./bytes";
+import {
+	fromBase64Url,
+	fromHex,
+	fromUtf8,
+	Sha256,
+	sha256Hex,
+	toBase64Url,
+	toHex,
+	utf8,
+} from "./bytes";
 import { Chunker, type ChunkerParams, checkChunkerParams, DEFAULT_CHUNKER } from "./cdc";
 import { deriveKeys, parseMasterKey, type RepositoryKeys } from "./keys";
 import { chunkIdOf, open, SealError, seal } from "./seal";
@@ -173,7 +182,7 @@ export class Repository {
 		const chunks: string[] = [];
 		const stats: WriteStats = { chunks: 0, newChunks: 0, newBytes: 0 };
 		let size = 0;
-		const hash = new IncrementalSha256();
+		const hash = new Sha256();
 		const store = async (pieces: Uint8Array<ArrayBuffer>[]) => {
 			for (const piece of pieces) {
 				const id = await chunkIdOf(this.#keys, piece);
@@ -193,8 +202,10 @@ export class Repository {
 		const parts = source instanceof Uint8Array ? [source] : source;
 		for await (const part of parts) {
 			size += part.length;
-			hash.update(part);
-			await store(chunker.push(part));
+			// The chunker copies the bytes first, whatever the digest does with them.
+			const pieces = chunker.push(part);
+			await hash.update(part);
+			await store(pieces);
 		}
 		await store(chunker.finish());
 		return { entry: { path, size, sha256: await hash.digest(), chunks }, stats };
@@ -325,28 +336,26 @@ export class Repository {
 		}
 		return out;
 	}
-}
 
-/**
- * SHA-256 over a file that arrives in pieces. Web Crypto has no streaming digest, so pieces are
- * kept until the end; a file is at most what one run holds in memory anyway.
- */
-class IncrementalSha256 {
-	#parts: Uint8Array[] = [];
-	#length = 0;
-
-	update(part: Uint8Array) {
-		this.#parts.push(part);
-		this.#length += part.length;
-	}
-
-	async digest(): Promise<string> {
-		const all = new Uint8Array(this.#length);
-		let at = 0;
-		for (const part of this.#parts) {
-			all.set(part, at);
-			at += part.length;
+	/**
+	 * A whole file as the chunks it was stored in, checked against its size and SHA-256: for a file
+	 * too large to hold twice, which putting it in one piece of memory would.
+	 */
+	async readFileChunks(entry: FileEntry): Promise<Uint8Array<ArrayBuffer>[]> {
+		const chunks: Uint8Array<ArrayBuffer>[] = [];
+		const hash = new Sha256();
+		let size = 0;
+		for await (const chunk of this.readFile(entry)) {
+			size += chunk.length;
+			if (size > entry.size) {
+				throw new RepositoryError(`${entry.path} is longer than its manifest says.`);
+			}
+			chunks.push(chunk);
+			await hash.update(chunk);
 		}
-		return sha256Hex(all);
+		if (size !== entry.size || (await hash.digest()) !== entry.sha256) {
+			throw new RepositoryError(`${entry.path} doesn't match its manifest.`);
+		}
+		return chunks;
 	}
 }

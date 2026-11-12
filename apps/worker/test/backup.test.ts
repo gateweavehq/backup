@@ -5,6 +5,7 @@ import {
 } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import {
+	concat,
 	dumpSqlite,
 	fromUtf8,
 	generateMasterKey,
@@ -25,7 +26,7 @@ import {
 	lateAlert,
 	runAlert,
 } from "../src/alerts";
-import { d1Reader, R2Store } from "../src/bindings";
+import { type BackupService, d1Reader, objectReader, R2Store } from "../src/bindings";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
 
@@ -353,6 +354,33 @@ async function addObjects() {
 	await env.APP_SEED.add("beta", [...NOTES, "INSERT INTO note VALUES (1, 'only')"]);
 	await env.APP_SEED.add("gamma.v2", NOTES);
 }
+
+describe("a database too large for one read", () => {
+	it("is read a page at a time, through D1 and an app's entrypoint, to the same dump", async () => {
+		await env.SOURCE_DB.batch(
+			Array.from({ length: 50 }, (_, i) =>
+				env.SOURCE_DB.prepare("INSERT INTO person (id, email, note) VALUES (?1, ?2, ?3)").bind(
+					100 + i,
+					`p${i}@example.com`,
+					"ğüş 🙂 ".repeat(i),
+				),
+			),
+		);
+		const whole = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const paged = await dumpSqlite(d1Reader(env.SOURCE_DB), { pageChars: 500 });
+		expect(paged.lines).toEqual(whole.lines);
+		expect(paged.stats).toEqual(whole.stats);
+
+		const notes = Array.from({ length: 40 }, (_, i) => `(${i + 1}, 'note ${"x".repeat(i)}')`);
+		await env.APP_SEED.add("big", [...NOTES, `INSERT INTO note VALUES ${notes.join(", ")}`]);
+		const app = (env as unknown as { APP: BackupService }).APP;
+		const object = await dumpSqlite(objectReader(app, "big"));
+		const pages = await dumpSqlite(objectReader(app, "big"), { pageChars: 300 });
+		expect(pages.lines).toEqual(object.lines);
+		expect(pages.stats).toEqual({ ...object.stats, consistent: true });
+		expect(object.stats.rows).toBe(40);
+	});
+});
 
 describe("an app's Durable Objects", () => {
 	it("go into one snapshot, a dump each, and each restores to the same rows", async () => {
@@ -685,6 +713,40 @@ describe("restore tests", () => {
 		const test = await testerFor(env, "cut").restore("cut", snapshot);
 		expect(test.error).toBe("The dump stops before its end: it is incomplete.");
 		expect(await testerTables("cut")).toEqual([]);
+	});
+
+	it("restore a dump cut into many chunks, between lines and inside characters", async () => {
+		// Irregular text, so the chunks' cuts don't fall in the same place in every row.
+		const letters = [..."ğüşıöç aeß🙂"];
+		const note = (i: number) =>
+			Array.from(
+				{ length: 300 + i * 11 },
+				(_, j) => letters[(i * 7 + j * j * 31 + j) % letters.length],
+			).join("");
+		await env.SOURCE_DB.batch(
+			Array.from({ length: 60 }, (_, i) =>
+				env.SOURCE_DB.prepare("INSERT INTO person (id, email, note) VALUES (?1, ?2, ?3)").bind(
+					100 + i,
+					`p${i}@example.com`,
+					note(i),
+				),
+			),
+		);
+		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
+		const repo = await Repository.init(new R2Store(env.VAULT, "chunked/"), env.BACKUP_KEY, {
+			chunker: { min: 128, avg: 512, max: 2048 },
+		});
+		const { entry } = await repo.writeFile("database.jsonl", utf8(joinLines(lines)));
+		const chunks = await repo.readFileChunks(entry);
+		expect(chunks.length).toBeGreaterThan(20);
+		expect(fromUtf8(concat(...chunks))).toBe(joinLines(lines));
+		// Some chunk starts in the middle of a character: a UTF-8 continuation byte.
+		expect(chunks.some((chunk) => ((chunk[0] ?? 0) & 0xc0) === 0x80)).toBe(true);
+		const snapshot = (await repo.commit({ kind: "d1", name: "chunked" }, [entry], {})).name;
+
+		const test = await testerFor(env, "chunked").restore("chunked", snapshot);
+		expect(test).toMatchObject({ passed: true, tables: 1, rows: 63, size: entry.size });
+		expect(await testerTables("chunked")).toEqual([]);
 	});
 
 	it("read RESTORE_TEST_DAYS as whole days", () => {

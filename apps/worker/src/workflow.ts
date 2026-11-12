@@ -7,7 +7,7 @@ import {
 import { NonRetryableError } from "cloudflare:workflows";
 import {
 	DUMP_FILE,
-	dumpSqlite,
+	dumpSqliteTo,
 	type FileEntry,
 	objectFile,
 	parseMasterKey,
@@ -15,6 +15,7 @@ import {
 	Repository,
 	RepositoryError,
 	retain,
+	type SqlReader,
 	utf8,
 } from "@gateweave/backup-core";
 import { type Alert, AlertConfigError, runAlert, sendAlert } from "./alerts";
@@ -93,6 +94,8 @@ interface ObjectPart {
 	tables: number;
 	rows: number;
 	empty: string[];
+	/** Whether its rows were read at one moment; see dumpSqliteTo. */
+	consistent: boolean;
 }
 
 /** A dump reads the whole database and writes what changed; a retry starts it over. */
@@ -268,7 +271,15 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			const tables = parts.reduce((sum, part) => sum + part.tables, 0);
 			const rows = parts.reduce((sum, part) => sum + part.rows, 0);
 			const empty = parts.flatMap((part) => part.empty.map((table) => `${part.name}/${table}`));
-			const meta = { objects: parts.length, tables, rows, empty };
+			const inconsistent = parts.filter((part) => !part.consistent).map((part) => part.name);
+			const meta = {
+				objects: parts.length,
+				tables,
+				rows,
+				empty,
+				// Objects that kept changing while they were read a page at a time.
+				...(inconsistent.length > 0 ? { inconsistent } : {}),
+			};
 			const entries = parts.map((part) => part.entry);
 			const manifest = await repo.commit({ kind: "do", name }, entries, meta);
 			return {
@@ -296,14 +307,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			} catch {
 				throw new NonRetryableError(`${source.name} listed an object whose name can't be a file.`);
 			}
-			let dump: Awaited<ReturnType<typeof dumpSqlite>>;
+			let dump: Awaited<ReturnType<typeof writeDump>>;
 			try {
-				dump = await dumpSqlite(objectReader(service, name));
+				dump = await writeDump(repo, path, objectReader(service, name));
 			} catch (error) {
 				if (error instanceof ObjectGone) continue;
 				throw error;
 			}
-			const { entry, stats } = await repo.writeFile(path, encodeLines(dump.lines));
+			const { entry, stats } = dump.written;
 			parts.push({
 				name,
 				entry,
@@ -311,6 +322,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				tables: dump.stats.tables,
 				rows: dump.stats.rows,
 				empty: dump.stats.empty,
+				consistent: dump.stats.consistent,
 			});
 		}
 		return parts;
@@ -336,9 +348,14 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			);
 		}
 		const repo = await this.#repository(source);
-		const dump = await dumpSqlite(d1Reader(binding));
-		const { entry, stats } = await repo.writeFile(DUMP_FILE, encodeLines(dump.lines));
-		const meta = { tables: dump.stats.tables, rows: dump.stats.rows, empty: dump.stats.empty };
+		const dump = await writeDump(repo, DUMP_FILE, d1Reader(binding));
+		const { entry, stats } = dump.written;
+		const meta = {
+			tables: dump.stats.tables,
+			rows: dump.stats.rows,
+			empty: dump.stats.empty,
+			...(dump.stats.consistent ? {} : { consistent: false }),
+		};
 		const manifest = await repo.commit({ kind: "d1", name: source.name }, [entry], meta);
 		return {
 			source: source.name,
@@ -397,11 +414,20 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	}
 }
 
+/**
+ * Dumps a database into the repository as it is read, so only a page of it is held at a time. A
+ * dump that starts over writes its file again; the chunks of the first try that nothing uses are
+ * pruned.
+ */
+function writeDump(repo: Repository, path: string, reader: SqlReader) {
+	return dumpSqliteTo(reader, (lines) => repo.writeFile(path, encodeLines(lines)));
+}
+
 /** The dump as `joinLines` writes it, in pieces of about a megabyte instead of one string. */
-async function* encodeLines(lines: string[]): AsyncGenerator<Uint8Array<ArrayBuffer>> {
+async function* encodeLines(lines: AsyncIterable<string>): AsyncGenerator<Uint8Array<ArrayBuffer>> {
 	let batch: string[] = [];
 	let length = 0;
-	for (const line of lines) {
+	for await (const line of lines) {
 		batch.push(line);
 		length += line.length + 1;
 		if (length >= 1 << 20) {

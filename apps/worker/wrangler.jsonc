@@ -102,24 +102,28 @@
 				},
 				{
 					"binding": "ID_DB",
-					"database_name": "gateweave-id",
-					"database_id": "5d2bfea4-2af1-4e9e-b966-c9df3b012d2a"
+					"database_name": "gateweave-id-eu",
+					"database_id": "63428cb2-0195-4a16-9a78-bff66bd560c7"
 				},
 				{
 					"binding": "TRACK_DB",
-					"database_name": "gateweave-track",
-					"database_id": "66bf2056-ee6d-48fe-a9a3-70c0a43712ea"
+					"database_name": "gateweave-track-eu",
+					"database_id": "bb35b197-846d-4e83-97b5-73a8f29e769e"
 				},
 				{
 					"binding": "AGENTS_DB",
-					"database_name": "gateweave-agents",
-					"database_id": "9d5a98e2-835c-4462-a0d5-d273a21340d8"
+					"database_name": "gateweave-agents-eu",
+					"database_id": "fd44c2ef-4ed9-4a19-9bf0-b4a055980096"
 				}
 			],
 			"r2_buckets": [
 				{ "binding": "VAULT", "bucket_name": "gateweave-backup", "jurisdiction": "eu" },
 				// Files attached in Track, a source: read, never written.
-				{ "binding": "TRACK_FILES", "bucket_name": "gateweave-track-files" }
+				{
+					"binding": "TRACK_FILES",
+					"bucket_name": "gateweave-track-files-eu",
+					"jurisdiction": "eu"
+				}
 			],
 			// Track's workspaces, and Agents' registries and conversations, each in a Durable Object,
 			// through the apps' Backup entrypoints.

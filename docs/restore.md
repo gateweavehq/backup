@@ -122,18 +122,19 @@ Pick what comes back with `--prefix`. Track keeps a workspace's files under `<wo
 this brings back one workspace's files and leaves alone the ones people deleted elsewhere:
 
 ```sh
-export GATEWEAVE_RESTORE_ENDPOINT_URL=https://<account id>.r2.cloudflarestorage.com
+export GATEWEAVE_RESTORE_ENDPOINT_URL=https://<account id>.eu.r2.cloudflarestorage.com
 export GATEWEAVE_RESTORE_ACCESS_KEY_ID=…
 export GATEWEAVE_RESTORE_SECRET_ACCESS_KEY=…
 node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest \
-  --to s3://gateweave-track-files --prefix "<workspace id>/"
+  --to s3://gateweave-track-files-eu --prefix "<workspace id>/"
 ```
 
 The bucket takes a second R2 API token, one with **Object Read & Write** for that bucket alone, in
 the `GATEWEAVE_RESTORE_*` variables, so the token that reads the backup can stay read-only. Without
 them the `AWS_*` ones are used, which suits a restore from a copy on disk. `--to-endpoint` and
-`--to-region` stand in for the endpoint and region. Track's files bucket isn't in a jurisdiction,
-so its endpoint has no `.eu`.
+`--to-region` stand in for the endpoint and region. Gateweave Cloud's bucket for Track's files is
+in the `eu` jurisdiction, so its endpoint has `.eu` after the account id; a bucket outside a
+jurisdiction has none.
 
 The CLI says each key it puts back and each it leaves, then counts them. Each object is read and
 checked as it is sent, and the upload is signed with the object's SHA-256, so the bucket refuses

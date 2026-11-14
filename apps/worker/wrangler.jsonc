@@ -114,6 +114,11 @@
 					"binding": "AGENTS_DB",
 					"database_name": "gateweave-agents-eu",
 					"database_id": "fd44c2ef-4ed9-4a19-9bf0-b4a055980096"
+				},
+				{
+					"binding": "GUARD_DB",
+					"database_name": "gateweave-guard-eu",
+					"database_id": "621f0e88-a743-4aef-91cd-374acd9cf157"
 				}
 			],
 			"r2_buckets": [
@@ -151,6 +156,8 @@
 					{ "name": "id", "kind": "d1", "binding": "ID_DB" },
 					{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
 					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" },
+					// Guard's tokens are sealed under its own SECRETS_KEY, so a restore needs that key too.
+					{ "name": "guard", "kind": "d1", "binding": "GUARD_DB" },
 					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
 					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" },
 					{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }

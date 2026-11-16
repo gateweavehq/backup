@@ -554,6 +554,74 @@ describe("an app's Durable Objects", () => {
 		]);
 		expect(await (await repository("objects")).snapshots()).toEqual([]);
 	});
+
+	it("of several kinds go into one snapshot, as Mail's do, a search index coming back empty", async () => {
+		// What Mail's entrypoint lists: a workspace's webhooks and audience, then its mailboxes. A
+		// mailbox has what Track's and Agents' objects don't: tables without a rowid, and a search
+		// index that keeps no text of its own, which a trigger on another table deletes from.
+		await env.APP_SEED.add("webhooks.w1", [
+			"CREATE TABLE webhook (id TEXT PRIMARY KEY, url TEXT NOT NULL, secret TEXT NOT NULL) STRICT, WITHOUT ROWID",
+			"INSERT INTO webhook VALUES ('h1', 'https://hooks.example/in', 'v2.key.sealed')",
+		]);
+		await env.APP_SEED.add("audience.w1", [
+			"CREATE TABLE template (id TEXT PRIMARY KEY, name TEXT NOT NULL, removed_at INTEGER) STRICT, WITHOUT ROWID",
+			"INSERT INTO template VALUES ('t1', 'Welcome', NULL)",
+		]);
+		await env.APP_SEED.add("mailbox.m1", [
+			"CREATE TABLE message (id TEXT PRIMARY KEY, object TEXT NOT NULL, size INTEGER NOT NULL, subject TEXT, seal TEXT, search_id INTEGER) STRICT",
+			"CREATE UNIQUE INDEX message_search_id ON message (search_id)",
+			"CREATE TABLE held (one INTEGER PRIMARY KEY CHECK (one = 1), bytes INTEGER NOT NULL) STRICT",
+			"INSERT INTO held (one, bytes) VALUES (1, 0)",
+			"CREATE TRIGGER message_added AFTER INSERT ON message BEGIN UPDATE held SET bytes = bytes + new.size WHERE one = 1; END",
+			"CREATE TABLE message_reference (message TEXT NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (message, ref)) STRICT, WITHOUT ROWID",
+			"CREATE VIRTUAL TABLE message_search USING fts5(subject, body, content = '', contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2')",
+			"CREATE TRIGGER message_search_gone AFTER DELETE ON message WHEN old.search_id IS NOT NULL BEGIN DELETE FROM message_search WHERE rowid = old.search_id; END",
+			"INSERT INTO message_search (rowid, subject, body) VALUES (1, 'Hello', 'a first letter')",
+			"INSERT INTO message VALUES ('a', 'w1/m1/a.eml', 120, 'Hello', 'v2.key.salt', 1), ('b', 'w1/m1/b.eml', 80, 'Re: Hello', NULL, NULL)",
+			"INSERT INTO message_reference VALUES ('b', '<a@example.com>'), ('b', '<z@example.com>')",
+		]);
+
+		const result = await backUp("mail", { sources: ["objects"] });
+		expect(result).toMatchObject({ ended: "complete", output: [{ status: "ok", test: "passed" }] });
+
+		const repo = await repository("objects");
+		const [name] = await repo.snapshots();
+		if (!name) throw new Error("No snapshot was made.");
+		const manifest = await repo.manifest(name);
+		expect(manifest.files.map((entry) => entry.path)).toEqual([
+			"objects/audience.w1.jsonl",
+			"objects/mailbox.m1.jsonl",
+			"objects/webhooks.w1.jsonl",
+		]);
+		expect(manifest.meta).toEqual({
+			objects: 3,
+			tables: 6,
+			rows: 7,
+			empty: ["mailbox.m1/message_search"],
+		});
+		expect(await testerTables("objects")).toEqual([]);
+
+		// The mailbox comes back with its rows as they were, the sealed ones still sealed, and its
+		// triggers made after them, so nothing is counted twice. Its search index is there and empty.
+		await restore(repo, name, "objects/mailbox.m1.jsonl");
+		const all = async (sql: string) => (await env.RESTORE_DB.prepare(sql).all()).results;
+		expect(await all("SELECT id, seal, search_id FROM message ORDER BY id")).toEqual([
+			{ id: "a", seal: "v2.key.salt", search_id: 1 },
+			{ id: "b", seal: null, search_id: null },
+		]);
+		expect(await all("SELECT bytes FROM held")).toEqual([{ bytes: 200 }]);
+		expect(await all("SELECT ref FROM message_reference ORDER BY ref")).toEqual([
+			{ ref: "<a@example.com>" },
+			{ ref: "<z@example.com>" },
+		]);
+		expect(
+			await all("SELECT rowid FROM message_search WHERE message_search MATCH 'hello'"),
+		).toEqual([]);
+		// The restored database still works as a mailbox's does: deleting a message whose search entry
+		// didn't come back is no error.
+		await env.RESTORE_DB.prepare("DELETE FROM message WHERE id = 'a'").run();
+		expect(await all("SELECT id FROM message")).toEqual([{ id: "b" }]);
+	});
 });
 
 /** Objects with what R2 keeps beside their bytes: a type, custom metadata, a cache setting. */

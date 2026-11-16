@@ -77,7 +77,7 @@ section is still to come where it says so.
   account. That makes it a target, so it comes later, if at all.
 - **Sources through bindings,** not API tokens: a D1 binding per database, an R2 binding per bucket,
   a KV binding per namespace, and a service binding to the `Backup` entrypoint of an app whose
-  Durable Objects hold its data. Track offers one; Agents and Mail will.
+  Durable Objects hold its data. Track, Agents and Mail each offer one.
 - **An app's objects through the app.** A Worker can't open another Worker's Durable Objects, so
   the app lends a reader with two methods: `objects(cursor)` lists the objects a page at a time,
   and `read(name, statements)` runs a dump's reads in one of them, inside a transaction it always

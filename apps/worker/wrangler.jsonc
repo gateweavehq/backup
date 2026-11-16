@@ -119,6 +119,11 @@
 					"binding": "GUARD_DB",
 					"database_name": "gateweave-guard-eu",
 					"database_id": "621f0e88-a743-4aef-91cd-374acd9cf157"
+				},
+				{
+					"binding": "MAIL_DB",
+					"database_name": "gateweave-mail-eu",
+					"database_id": "c0c5468c-f84b-45b8-a804-6412544febef"
 				}
 			],
 			"r2_buckets": [
@@ -128,13 +133,19 @@
 					"binding": "TRACK_FILES",
 					"bucket_name": "gateweave-track-files-eu",
 					"jurisdiction": "eu"
-				}
+				},
+				// Mail's raw mail, a source: read, never written. Mail seals each object under its own
+				// SECRETS_KEY, which this Worker never holds, so the objects are copied as they are,
+				// still sealed.
+				{ "binding": "MAIL_RAW", "bucket_name": "gateweave-mail-eu", "jurisdiction": "eu" }
 			],
-			// Track's workspaces, and Agents' registries and conversations, each in a Durable Object,
-			// through the apps' Backup entrypoints.
+			// Track's workspaces, Agents' registries and conversations, and Mail's mailboxes with each
+			// workspace's webhooks and audience, each in a Durable Object, through the apps' Backup
+			// entrypoints. Mail's production Worker is its `cloud` environment, with a name of its own.
 			"services": [
 				{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" },
-				{ "binding": "AGENTS_APP", "service": "gateweave-agents", "entrypoint": "Backup" }
+				{ "binding": "AGENTS_APP", "service": "gateweave-agents", "entrypoint": "Backup" },
+				{ "binding": "MAIL_APP", "service": "gateweave-mail-cloud", "entrypoint": "Backup" }
 			],
 			"durable_objects": {
 				"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]
@@ -158,9 +169,14 @@
 					{ "name": "agents", "kind": "d1", "binding": "AGENTS_DB" },
 					// Guard's tokens are sealed under its own SECRETS_KEY, so a restore needs that key too.
 					{ "name": "guard", "kind": "d1", "binding": "GUARD_DB" },
+					// Mail's provider keys in D1, its webhooks' secrets and its raw mail are sealed under
+					// Mail's own SECRETS_KEY, so a restore needs that key too: docs/restore.md, "Mail".
+					{ "name": "mail", "kind": "d1", "binding": "MAIL_DB" },
 					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
 					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" },
-					{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }
+					{ "name": "mail-objects", "kind": "do", "binding": "MAIL_APP" },
+					{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" },
+					{ "name": "mail-raw", "kind": "r2", "binding": "MAIL_RAW" }
 				],
 				"RETENTION": "1l 7d 3w",
 				"RESTORE_TEST_DAYS": "30",

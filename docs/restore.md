@@ -157,6 +157,73 @@ node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest --to 
 A key that can't be a path in a folder, such as one with `..` or `//` in it, stops the restore and
 says so.
 
+## Restore Gateweave Mail
+
+Mail's data is in three sources, and mail that reads again needs all three, and one thing no
+backup holds: Mail's own key.
+
+| Source         | Kind            | What it holds                                                                                                                            |
+| -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `mail`         | D1              | Accounts, workspaces, mailboxes and the address directory, with the workspaces' provider keys and Resend secrets, sealed by Mail         |
+| `mail-objects` | Durable Objects | `mailbox.<mailbox id>`: a mailbox's index. `webhooks.<workspace id>` and `audience.<workspace id>`: a workspace's webhooks and templates |
+| `mail-raw`     | R2              | Every message as Mail keeps it, under `<workspace id>/<mailbox id>/`, sealed by Mail                                                     |
+
+**Mail's key comes from the operator.** Mail seals raw mail, provider keys, Resend secrets and
+webhooks' signing secrets under its `SECRETS_KEY`, a secret of the Worker `gateweave-mail-cloud`.
+Backup never holds it and no snapshot does: the bucket's objects are copied as they are, and a
+dump copies rows as they are. So the master key opens a snapshot, and what comes out is still
+sealed by Mail. Keep `SECRETS_KEY` where the master key is kept, and `SECRETS_KEY_PREVIOUS` too
+while Mail has one. Without it the restore gives back the accounts, the directory, each mailbox's
+index (addresses, subjects, dates, what was sent and how it went) and the templates, and no
+message's body or attachments, no provider key and no webhook's secret.
+
+A message opens with three things: that key, the salt in its row (`seal`, in its mailbox's
+`message` table) and its object's name. So raw mail goes back under the keys it had, which is
+what the CLI does, and beside the mailbox's rows from a snapshot that has the message.
+
+**The three are read one after another,** each at its own moment of the night. A message that
+arrived or was deleted in between can have its row in one snapshot and no object in the other, or
+the other way round.
+
+**The database.** As any D1 database, into a new one:
+
+```sh
+node gateweave-backup.mjs restore s3://gateweave-backup/mail latest --to ./restore
+```
+
+**Raw mail.** Into the bucket, where the keys are free, a mailbox at a time. The bucket is in the
+`eu` jurisdiction, so its endpoint has `.eu` after the account id. Mail keeps no metadata on the
+objects, so none is lost on the way:
+
+```sh
+node gateweave-backup.mjs restore s3://gateweave-backup/mail-raw latest \
+  --to s3://gateweave-mail-eu --prefix "<workspace id>/<mailbox id>/"
+```
+
+**A mailbox, a workspace's webhooks or its templates.** As any app's object, to a file:
+
+```sh
+node gateweave-backup.mjs restore s3://gateweave-backup/mail-objects latest \
+  --to ./restore --as sqlite --object mailbox.<mailbox id>
+```
+
+What this doesn't cover:
+
+- **Putting an object back into the live app.** Mail has no way to load a mailbox's, a webhooks'
+  or an audience's database, so a restored one is read with `sqlite3` or loaded by hand. Raw mail
+  put back into the bucket shows in Mail only while its mailbox still has the message's row.
+- **A mailbox's search index.** It keeps no text of its own (`message_search`, a contentless FTS5
+  table), so it comes back empty, and the snapshot's `empty` names it. A mailbox loaded from a dump
+  needs its messages indexed again.
+- **Rate limits and the queue.** Mail leaves its rate limiter's objects out of what it lists:
+  they hold counters that expire. Delivery events waiting in its queue are in no backup.
+- **A very large mailbox.** `message_reference` and `delivery` have no rowid, so a mailbox in which
+  one of them alone passes 12 million characters can't be read a page at a time, and the backup of
+  `mail-objects` fails and says so ([deploy.md](deploy.md#what-it-cant-do-yet)).
+- **That a message opens.** Restore tests restore `mail` and each object's dump and count their
+  rows, and read every object of `mail-raw` back against `bucket.json`. None of them has Mail's
+  key, so none can tell that a sealed message opens.
+
 ## When it fails
 
 The CLI says what went wrong and names the object, never what is in it:

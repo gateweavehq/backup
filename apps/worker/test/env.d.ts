@@ -9,5 +9,17 @@ declare namespace Cloudflare {
 			add(name: string, statements: string[]): Promise<void>;
 			clear(): Promise<void>;
 		};
+		EXAMPLE_SEED: {
+			list(ids: string[]): Promise<void>;
+			write(id: string, bodies: string[]): Promise<void>;
+			remove(id: string): Promise<void>;
+			clear(): Promise<void>;
+		};
 	}
+}
+
+/** A file's text, as Vite gives it. */
+declare module "*?raw" {
+	const text: string;
+	export default text;
 }

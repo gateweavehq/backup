@@ -5,9 +5,11 @@ Guidance for AI coding agents (and humans) working in this repository.
 ## The project
 
 Gateweave Backup makes scheduled, encrypted backups of Cloudflare data (D1, Durable Objects'
-SQLite, R2, KV), keeps a copy outside Cloudflare, and tests its restores. Read
-[docs/architecture.md](docs/architecture.md) first, and [docs/format.md](docs/format.md) before
-touching anything that reads or writes a repository.
+SQLite and R2; KV is not built), can keep a copy outside Cloudflare, and tests its restores. Read
+[docs/architecture.md](docs/architecture.md) first, [docs/format.md](docs/format.md) before
+touching anything that reads or writes a repository, and
+[docs/app-entrypoint.md](docs/app-entrypoint.md) before changing what an app's `Backup`
+entrypoint is asked.
 
 ## Repository map
 
@@ -16,7 +18,7 @@ touching anything that reads or writes a repository.
 | `packages/core` | The repository format: keys, sealing, chunking, SQLite dumps, retention |
 | `apps/worker`   | The Worker: the backup Workflow, restore tests, alerts, the catalog     |
 | `packages/cli`  | The restore CLI: reads a repository with the key, writes files back     |
-| `docs/`         | Architecture, the format, deploying and restoring                       |
+| `docs/`         | Architecture, the format, deploying, restoring, an app's entrypoint     |
 | `scripts/`      | `keygen`                                                                |
 
 ## Commands
@@ -67,12 +69,17 @@ Requirements: Node.js 24 (see `.node-version`; 22.13+ works) and pnpm 12.
   Object. workerd has no jurisdictions, so the tests leave `JURISDICTION` empty. Their key is public
   and only theirs. A stand-in app (`test/app-worker.js`) offers its Durable Objects through a
   `Backup` entrypoint as Track does, and a `Seed` one for the tests to fill them.
+- The example in docs/app-entrypoint.md is `test/example-app.ts`, word for word; a test fails when
+  they differ, so change both together. It runs as a Worker of its own in the tests
+  (`test/example-worker.js` adds what they need), compiled by `vitest.config.ts`.
 - A Workflow step's error comes back with its class name in front; the catalog stores it without.
 - Alert tests send to stand-ins: an `EMAIL` binding and a `fetch` of the test's own, never Email
   Service or the network.
 
 ## Git
 
-- Conventional Commits, explaining why in the body.
+- Conventional Commits, explaining why in the body. Changes land through pull requests with a
+  green `check`; fill in the template. Pull requests leave `CHANGELOG.md` alone: a maintainer
+  writes a version's entry when releasing it.
 - Commits, pull requests and comments carry no AI attribution: no `Co-authored-by` naming an AI, no
   "Generated with" line and no session link.

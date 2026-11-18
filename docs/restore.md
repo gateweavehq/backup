@@ -8,9 +8,13 @@ A restore never goes over live data. The CLI writes only new files, into a folde
 load them into a **new** database. A bucket's objects can go straight back into a bucket, but only
 where their keys are free. It only reads the repository, whatever its credentials allow.
 
+The names here are [deploy.md](deploy.md)'s example: the backup bucket is `my-backup`, and the
+sources are an app's D1 database (`shop`), its Durable Objects (`shop-carts`) and its bucket
+(`shop-files`).
+
 ## Get the CLI
 
-It is one file that runs on Node.js 22.13 or later:
+It is one file that runs on Node.js 22.13 or later. At the root of a checkout:
 
 ```sh
 pnpm install
@@ -19,7 +23,8 @@ node packages/cli/dist/gateweave-backup.mjs --help
 ```
 
 `packages/cli/dist/gateweave-backup.mjs` can be copied anywhere and run with `node`. Keep a copy
-with your key's backup, so a restore doesn't depend on this repository either.
+with your key's backup, so a restore doesn't depend on this repository either. The commands below
+run it from where it was copied to, as `node gateweave-backup.mjs`.
 
 ## The key
 
@@ -28,12 +33,13 @@ when something is piped in, or asks for it without showing it. It never takes th
 argument, since shells keep those in their history. Piping it from a password manager works:
 
 ```sh
-op read "op://Private/Gateweave Backup/key" | node gateweave-backup.mjs snapshots ./track
+op read "op://Private/Backup/key" | node gateweave-backup.mjs snapshots ./shop
 ```
 
 ## Reach the repository
 
-Each source has its own repository, in the bucket's folder of the same name (`track`, `id`, …).
+Each source has its own repository, in the bucket's folder of the same name (`shop`,
+`shop-carts`, …).
 
 **Straight from R2.** Make an R2 API token in the dashboard (R2 object storage › Overview › API
 Tokens › Manage) with the **Object Read only** permission, for the backup bucket alone. It gives an
@@ -43,27 +49,27 @@ Access Key ID and a Secret Access Key:
 export AWS_ACCESS_KEY_ID=…
 export AWS_SECRET_ACCESS_KEY=…
 export AWS_ENDPOINT_URL=https://<account id>.r2.cloudflarestorage.com
-node gateweave-backup.mjs snapshots s3://gateweave-backup/track
+node gateweave-backup.mjs snapshots s3://my-backup/shop
 ```
 
 A bucket made in a jurisdiction is reached only through that jurisdiction's endpoint:
-`https://<account id>.eu.r2.cloudflarestorage.com` for an EU bucket. Gateweave's own bucket is one.
+`https://<account id>.eu.r2.cloudflarestorage.com` for an EU bucket.
 
 Any other S3-compatible bucket works the same way, with its endpoint and keys, and `--region` (or
-`AWS_REGION`) when the provider wants one.
+`AWS_REGION`) when the provider wants one. That is how the copy outside Cloudflare is read.
 
 **From a copy.** A folder holding a repository's `config.json`, `snapshots/` and `data/`, as
 `rclone copy` or `aws s3 sync` leaves it, is a repository too:
 
 ```sh
-node gateweave-backup.mjs snapshots ./track
+node gateweave-backup.mjs snapshots ./shop
 ```
 
 ## Look before restoring
 
 ```sh
-node gateweave-backup.mjs snapshots s3://gateweave-backup/track
-node gateweave-backup.mjs show s3://gateweave-backup/track latest
+node gateweave-backup.mjs snapshots s3://my-backup/shop
+node gateweave-backup.mjs show s3://my-backup/shop latest
 ```
 
 `show` lists a snapshot's files and, for a database, every table with its row count. It prints
@@ -75,15 +81,15 @@ dump.
 `check --all` does that for every snapshot. Nothing is written to disk.
 
 ```sh
-node gateweave-backup.mjs check s3://gateweave-backup/track --all
+node gateweave-backup.mjs check s3://my-backup/shop --all
 ```
 
 ## Restore a D1 database
 
 ```sh
-node gateweave-backup.mjs restore s3://gateweave-backup/track latest --to ./restore
-npx wrangler d1 create track-restored
-npx wrangler d1 execute track-restored --remote --file ./restore/database.sql
+node gateweave-backup.mjs restore s3://my-backup/shop latest --to ./restore
+npx wrangler d1 create shop-restored
+npx wrangler d1 execute shop-restored --remote --file ./restore/database.sql
 ```
 
 Check the new database, then point the app at it, or copy the rows you need from it. Don't load the
@@ -95,22 +101,24 @@ tool. `--as files` writes the files the snapshot holds, as they were backed up (
 
 ## Restore an app's Durable Objects
 
-A snapshot of an app's Durable Objects, such as Track's workspaces, holds a database per object.
-`show` lists them, and `--object <name>` shows one's tables. `restore` writes `<object>.sql` for each
-object, or `<object>.sqlite` with `--as sqlite`; `--object` restores only the one it names:
+A snapshot of an app's Durable Objects holds a database per object. `show` lists them, and
+`--object <name>` shows one's tables. `restore` writes `<object>.sql` for each object, or
+`<object>.sqlite` with `--as sqlite`; `--object` restores only the one it names:
 
 ```sh
-node gateweave-backup.mjs show s3://gateweave-backup/track-workspaces latest
-node gateweave-backup.mjs restore s3://gateweave-backup/track-workspaces latest --to ./restore --as sqlite --object <workspace id>
+node gateweave-backup.mjs show s3://my-backup/shop-carts latest
+node gateweave-backup.mjs restore s3://my-backup/shop-carts latest --to ./restore --as sqlite --object <name>
 ```
 
 Each file is one object's database. Read it with `sqlite3`, or load the SQL into a new D1 database
-to look at it. Putting it back into the live app's object is the app's to offer; Track doesn't yet.
+to look at it. Putting it back into the live app's object is the app's to offer
+([app-entrypoint.md](app-entrypoint.md#what-a-restore-then-needs-from-the-app)); Gateweave Track,
+whose workspaces are backed up this way, doesn't yet.
 
 ## Restore an R2 bucket's objects
 
-A snapshot of a bucket, such as Track's files, holds every object's bytes and `bucket.json`, which
-lists them with their metadata ([format.md](format.md#manifests)).
+A snapshot of a bucket holds every object's bytes and `bucket.json`, which lists them with their
+metadata ([format.md](format.md#manifests)).
 
 **Into the bucket.** `--to s3://<bucket>` puts the objects back, each under its key with its type,
 its other HTTP metadata and its custom metadata. An object goes in only where its key is free: every
@@ -118,49 +126,74 @@ upload carries `If-None-Match: *`, so the bucket refuses one whose key is taken,
 ever replaced. That makes it safe to aim at the live bucket, which gets back what is missing and
 keeps the rest as it is.
 
-Pick what comes back with `--prefix`. Track keeps a workspace's files under `<workspace id>/`, so
-this brings back one workspace's files and leaves alone the ones people deleted elsewhere:
+Pick what comes back with `--prefix`. An app that keeps each customer's files under
+`<customer id>/` brings back one customer's files this way, and leaves alone the ones people
+deleted elsewhere:
 
 ```sh
-export GATEWEAVE_RESTORE_ENDPOINT_URL=https://<account id>.eu.r2.cloudflarestorage.com
+export GATEWEAVE_RESTORE_ENDPOINT_URL=https://<account id>.r2.cloudflarestorage.com
 export GATEWEAVE_RESTORE_ACCESS_KEY_ID=…
 export GATEWEAVE_RESTORE_SECRET_ACCESS_KEY=…
-node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest \
-  --to s3://gateweave-track-files-eu --prefix "<workspace id>/"
+node gateweave-backup.mjs restore s3://my-backup/shop-files latest \
+  --to s3://shop-files --prefix "<customer id>/"
 ```
 
 The bucket takes a second R2 API token, one with **Object Read & Write** for that bucket alone, in
 the `GATEWEAVE_RESTORE_*` variables, so the token that reads the backup can stay read-only. Without
 them the `AWS_*` ones are used, which suits a restore from a copy on disk. `--to-endpoint` and
-`--to-region` stand in for the endpoint and region. Gateweave Cloud's bucket for Track's files is
-in the `eu` jurisdiction, so its endpoint has `.eu` after the account id; a bucket outside a
-jurisdiction has none.
+`--to-region` stand in for the endpoint and region. A bucket in a jurisdiction has it in its
+endpoint, such as `.eu` after the account id; a bucket outside one has none.
 
 The CLI says each key it puts back and each it leaves, then counts them. Each object is read and
 checked as it is sent, and the upload is signed with the object's SHA-256, so the bucket refuses
 bytes that don't match it. When a restore stops half way, say on a damaged chunk, the objects put
 back so far stay, each one whole, and the same restore run again puts back the rest.
 
-The S3 API keeps custom metadata names in lower case, R2 included: Track's `uploadedBy` comes back
-as `uploadedby`, and the CLI says so. Track reads that name only to tell a retried upload from
-someone else's, so restored files work as before. Metadata no header can carry, such as a name
-outside ASCII, stops the restore before anything is sent; an object over 4.995 GiB, more than one
-upload takes at R2, does too.
+The S3 API keeps custom metadata names in lower case, R2 included: a name such as `uploadedBy`
+comes back as `uploadedby`, and the CLI says so. Check what your app does with a name that lost
+its capitals. Gateweave Track reads its `uploadedBy` only to tell a retried upload from someone
+else's, so its restored files work as before. Metadata no header can carry, such as a name outside
+ASCII, stops the restore before anything is sent; an object over 4.995 GiB, more than one upload
+takes at R2, does too.
 
 **Into a folder.** `--to <folder>` writes `bucket.json`, and each object at `files/<key>`.
 `--prefix` works here too.
 
 ```sh
-node gateweave-backup.mjs restore s3://gateweave-backup/track-files latest --to ./restore
+node gateweave-backup.mjs restore s3://my-backup/shop-files latest --to ./restore
 ```
 
 A key that can't be a path in a folder, such as one with `..` or `//` in it, stops the restore and
 says so.
 
-## Restore Gateweave Mail
+## An app that seals its data under its own key
 
-Mail's data is in three sources, and mail that reads again needs all three, and one thing no
-backup holds: Mail's own key.
+The rule: **Backup copies what is there, as it is.** A dump copies a database's rows as they are
+stored, and a bucket's snapshot copies its objects' bytes. So whatever an app encrypted before
+storing it is in the backup still encrypted, under the app's key and not the backup's. The master
+key opens the snapshot, and what comes out needs the app's key to read. Backup never holds that
+key, and no snapshot does.
+
+For such an app, a restore therefore needs:
+
+- **The app's key, kept by its operator** where the master key is kept, with any earlier key the
+  app still reads with. Without it the restore gives back everything the app stored in the clear,
+  and none of what it sealed.
+- **Whatever else the app opens a sealed thing with,** restored beside it: a salt in a row, the
+  object's own name. So such objects go back under the keys they had, and beside the rows that
+  describe them.
+- **Sources that agree.** Each source is read at its own moment of the night, so a row in one
+  snapshot can point at an object that another doesn't hold yet, or no longer holds.
+- **A way of its own to know that it worked.** Restore tests count rows and check bytes. They
+  have no app's key, so they can't tell that a sealed thing opens.
+
+### A worked example: Gateweave Mail
+
+[Gateweave Mail](https://github.com/gateweavehq/mail) is such an app, and Gateweave Cloud backs it
+up with the configuration in `env.gateweave` ([deploy.md](deploy.md#an-example-of-a-real-configuration-envgateweave)),
+so the names below are that deployment's: the backup bucket is `gateweave-backup`, in the EU
+jurisdiction. Mail's data is in three sources, and mail that reads again needs all three, and one
+thing no backup holds: Mail's own key.
 
 | Source         | Kind            | What it holds                                                                                                                            |
 | -------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |

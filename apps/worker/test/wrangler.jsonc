@@ -19,7 +19,11 @@
 	// The stand-in app (test/app-worker.js): its Backup entrypoint, and a way to fill it.
 	"services": [
 		{ "binding": "APP", "service": "app", "entrypoint": "Backup" },
-		{ "binding": "APP_SEED", "service": "app", "entrypoint": "Seed" }
+		{ "binding": "APP_SEED", "service": "app", "entrypoint": "Seed" },
+		// The example app of docs/app-entrypoint.md (test/example-app.ts). Not a source: the tests
+		// read it as a backup does.
+		{ "binding": "EXAMPLE", "service": "example", "entrypoint": "Backup" },
+		{ "binding": "EXAMPLE_SEED", "service": "example", "entrypoint": "Seed" }
 	],
 	"durable_objects": {
 		"bindings": [{ "name": "RESTORE_TEST", "class_name": "RestoreTest" }]

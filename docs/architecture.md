@@ -1,8 +1,9 @@
 # Architecture
 
 Gateweave Backup keeps copies of what an app on Cloudflare stores (D1 databases, Durable Objects'
-SQLite, R2 buckets, KV) somewhere a mistake, a bad deploy or a lost account can't reach. It
-encrypts them before they leave, keeps them under a retention policy, and tests that they restore.
+SQLite and R2 buckets today; KV is not built) somewhere a mistake or a bad deploy can't reach,
+and, when a bucket at another provider is set, somewhere a lost account can't either. It encrypts
+them before they leave, keeps them under a retention policy, and tests that they restore.
 
 ## Why it exists
 
@@ -26,11 +27,12 @@ the same account.
 2. **The key stays with the owner.** Data is sealed before it is written. The Worker holds the key
    as a secret, and nothing else holds it.
 3. **One copy outside Cloudflare.** The 3-2-1 rule: three copies, on two kinds of storage, one
-   elsewhere. A locked R2 bucket plus an S3-compatible bucket at another provider.
+   elsewhere. A locked R2 bucket plus an S3-compatible bucket at another provider. The second is
+   a setting, `COPY_TO`: a deployment that names no bucket there has no copy outside Cloudflare.
 4. **Never restore over live data.** A restore goes to a new database, or into a bucket only where
    a key is free, with a preview of what is in it.
 5. **A backup that wasn't restored isn't known to work.** A monthly restore test is part of the
-   product, and its date is shown next to every source.
+   product, and the catalog keeps each one's date and outcome for every source.
 
 ## Pieces
 
@@ -69,15 +71,16 @@ the same account.
 
 [deploy.md](deploy.md) says how to set it up. Today it backs up D1, an app's Durable Objects
 through its `Backup` entrypoint, and R2 buckets, into one R2 bucket, with the catalog, the lock and
-retention, and copies them to a bucket at another provider when one is set; the rest of this
-section is still to come where it says so.
+retention, and copies them to a bucket at another provider when one is set. What it doesn't have
+is at this section's end.
 
-- **Runs in the owner's own Cloudflare account,** through the Deploy button, so the data and the
-  key never pass through Gateweave. A hosted version would hold a token for every customer's
-  account. That makes it a target, so it comes later, if at all.
+- **Runs in the owner's own Cloudflare account,** deployed with Wrangler from a checkout, so the
+  data and the key never pass through Gateweave. A hosted version would hold a token for every
+  customer's account. That makes it a target, so it comes later, if at all.
 - **Sources through bindings,** not API tokens: a D1 binding per database, an R2 binding per bucket,
-  a KV binding per namespace, and a service binding to the `Backup` entrypoint of an app whose
-  Durable Objects hold its data. Track, Agents and Mail each offer one.
+  and a service binding to the `Backup` entrypoint of an app whose Durable Objects hold its data.
+  Track, Agents and Mail each offer one, and [app-entrypoint.md](app-entrypoint.md) says how
+  another app does.
 - **An app's objects through the app.** A Worker can't open another Worker's Durable Objects, so
   the app lends a reader with two methods: `objects(cursor)` lists the objects a page at a time,
   and `read(name, statements)` runs a dump's reads in one of them, inside a transaction it always
@@ -100,12 +103,18 @@ section is still to come where it says so.
   prune, test when due, copy when set, finish. Steps are durable and retried, so a run that stops resumes at the step it was on,
   and a failed source doesn't stop the others. The Workflow's own `schedules` start a run each night;
   `wrangler workflows trigger` starts one by hand.
-- **A D1 catalog** of runs, snapshots, locks and restore tests feeds the page, the alerts and
-  MCP. It describes the bucket and never replaces it.
+- **A D1 catalog** of runs, snapshots, locks, restore tests, copies and alerts is where the daily
+  check and the alerts read from, and what an owner asks with `wrangler d1 execute`
+  ([deploy.md](deploy.md)). It describes the bucket and never replaces it.
 - **A lock per source.** Pruning deletes the chunks no manifest names, so it must never meet a run
   that has found a chunk stored and not yet written its manifest. A run takes the source's lock
   before its first write and gives it back after its last; one that dies frees it after 12 hours.
-  The Workflow also runs one instance at a time, but scheduled instances may start past that limit.
+  A run that finds the lock held fails that source at once, saying another run is backing it up,
+  writes nothing and leaves the lock with its holder; its other sources go on, and the run ends
+  as failed and alerts. The lock is all that keeps runs apart. The Workflow had a limit of one
+  instance at a time as well, from 2026-11-14 to 2026-11-18: scheduled instances never counted
+  towards it, and under it every run started by hand stayed queued for good while nothing else
+  ran, so it went.
 - **Retention:** the newest snapshot, then 7 daily, 4 weekly and 12 monthly by default. Pruning
   forgets manifests first, then deletes the chunks nothing points to. The snapshot a run just made
   always stays.
@@ -150,7 +159,10 @@ section is still to come where it says so.
   doesn't send it twice. One that can't be sent stays there with why, the run ends as it would have,
   and the morning check tries it again for three days. Its text names sources, snapshots and steps,
   never data, like the catalog's errors. Opening a Track issue can come through the webhook.
-- **MCP (next):** agents can list and check backups. A restore needs a person.
+- **Not built:** KV sources; a page that shows the catalog, so the Worker answers no requests and
+  the catalog is read with Wrangler; an MCP server for agents to list and check backups; and a
+  Deploy to Cloudflare button, since the Worker's configuration is in `apps/worker` and names its
+  sources by hand. [deploy.md](deploy.md#what-it-cant-do-yet) has the limits of what is built.
 
 ### CLI
 

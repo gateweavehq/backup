@@ -5,7 +5,7 @@ export { BackupWorkflow } from "./workflow";
 
 /**
  * Backups run on the Workflow's schedule, or by hand with `wrangler workflows trigger`. The Worker
- * answers no requests until it has a page with sign-in in front of it. Its own cron is the daily
+ * answers no requests: it has no page, and nothing to offer without sign-in. Its own cron is the daily
  * check that the backups happened, and that their alerts went out.
  */
 export default {

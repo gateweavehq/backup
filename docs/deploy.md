@@ -4,35 +4,44 @@ The Worker runs in the Cloudflare account whose data it backs up, so the data an
 pass through anyone else. It needs Workers Paid: a backup step needs minutes of CPU, and Workflows
 on Free get 10 ms a step.
 
-Run these from `apps/worker`, logged in with `npx wrangler login`.
+Run these from `apps/worker` in a checkout of this repository, after `pnpm install` at its root,
+logged in with `npx wrangler login`.
+
+The names here are an example. The Worker, its bucket, its catalog and its Workflow are all called
+`my-backup`, and the app it backs up is called `shop`: a Worker `shop` with a D1 database, carts
+in Durable Objects and a bucket of files. Use your own.
 
 ## 1. The key
 
 ```sh
-pnpm keygen
+pnpm -w keygen
 ```
 
-prints a new master key. Put it in a password manager **before anything else**. Every backup is
+prints a new master key (`-w` because the script is the repository root's, and these commands
+run in `apps/worker`). Put it in a password manager **before anything else**. Every backup is
 sealed with it, and without it none of them opens: nobody, Gateweave included, can recover it.
 
 ## 2. The bucket and the catalog
 
 ```sh
-npx wrangler r2 bucket create gateweave-backup
-npx wrangler d1 create gateweave-backup
+npx wrangler r2 bucket create my-backup
+npx wrangler d1 create my-backup
 ```
 
-Put the catalog's `database_id` in `wrangler.jsonc`, then make its tables:
+`apps/worker/wrangler.jsonc` comes with `gateweave-backup` for all four names. At its top level,
+above `env`, set the Worker's `name`, the vault's `bucket_name`, the catalog's `database_name` and
+the Workflow's `name` to yours, and put the `database_id` that `d1 create` printed beside
+`database_name`. Then make the catalog's tables:
 
 ```sh
-npx wrangler d1 migrations apply gateweave-backup --remote
+npx wrangler d1 migrations apply my-backup --remote
 ```
 
 Lock the bucket, so that nothing can delete or overwrite a backup for 30 days: not a mistake, not a
 bad deploy, and not someone who gets hold of a token.
 
 ```sh
-npx wrangler r2 bucket lock add gateweave-backup keep-30-days "" --retention-days 30
+npx wrangler r2 bucket lock add my-backup keep-30-days "" --retention-days 30
 ```
 
 Retention still runs under a lock. What it would delete before the lock allows is left for a later
@@ -44,11 +53,11 @@ Each D1 database to back up gets a binding in `d1_databases` and an entry in `SO
 
 ```jsonc
 "d1_databases": [
-	{ "binding": "CATALOG", "database_name": "gateweave-backup", "database_id": "…", "migrations_dir": "migrations" },
-	{ "binding": "TRACK_DB", "database_name": "gateweave-track", "database_id": "…" }
+	{ "binding": "CATALOG", "database_name": "my-backup", "database_id": "…", "migrations_dir": "migrations" },
+	{ "binding": "SHOP_DB", "database_name": "shop", "database_id": "…" }
 ],
 "vars": {
-	"SOURCES": [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" }]
+	"SOURCES": [{ "name": "shop", "kind": "d1", "binding": "SHOP_DB" }]
 }
 ```
 
@@ -56,21 +65,22 @@ A source's `name` is its folder in the bucket. Choose it once: a new name starts
 
 ### An app's Durable Objects
 
-An app that offers a `Backup` entrypoint, as Track does, gets a service binding to it and a source
-of kind `do`. The app must be a Worker in the same account:
+An app that offers a `Backup` entrypoint gets a service binding to it and a source of kind `do`.
+The app must be a Worker in the same account. [app-entrypoint.md](app-entrypoint.md) says what
+the entrypoint is and how to write one for your app:
 
 ```jsonc
-"services": [{ "binding": "TRACK_APP", "service": "gateweave-track", "entrypoint": "Backup" }],
+"services": [{ "binding": "SHOP_APP", "service": "shop", "entrypoint": "Backup" }],
 "vars": {
 	"SOURCES": [
-		{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
-		{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" }
+		{ "name": "shop", "kind": "d1", "binding": "SHOP_DB" },
+		{ "name": "shop-carts", "kind": "do", "binding": "SHOP_APP" }
 	]
 }
 ```
 
-The app says which objects there are; Track lists its workspaces. Each night's snapshot holds a
-dump per object, under its name, and stores only the dumps that changed.
+The app says which objects there are. Each night's snapshot holds a dump per object, under its
+name, and stores only the dumps that changed.
 
 ### An R2 bucket
 
@@ -79,33 +89,34 @@ with its metadata, and reads only the objects that are new or were replaced sinc
 
 ```jsonc
 "r2_buckets": [
-	{ "binding": "VAULT", "bucket_name": "gateweave-backup" },
-	{ "binding": "TRACK_FILES", "bucket_name": "gateweave-track-files" }
+	{ "binding": "VAULT", "bucket_name": "my-backup" },
+	{ "binding": "SHOP_FILES", "bucket_name": "shop-files" }
 ],
 "vars": {
-	"SOURCES": [{ "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }]
+	"SOURCES": [{ "name": "shop-files", "kind": "r2", "binding": "SHOP_FILES" }]
 }
 ```
 
 The binding needs only to read, but Workers bindings can't be made read-only: the backup lists and
 gets, and never writes there. `VAULT` itself can't be a source.
 
-## 4. Deploy and set the key
+## 4. Set the key and deploy
 
 ```sh
-npx wrangler deploy
 npx wrangler secret put BACKUP_KEY
+npx wrangler deploy
 ```
 
-and paste the key when asked. Backups run every night at 03:17 UTC (`schedules` in
-`wrangler.jsonc`).
+Paste the key when asked. The key goes first: the configuration requires it (`secrets.required`),
+and a deploy without it is refused. The Worker doesn't exist yet, so Wrangler offers to make it
+to hold the secret; say yes. Backups run every night at 03:17 UTC (`schedules` in `wrangler.jsonc`).
 
 ## 5. Run one now, and check it
 
 ```sh
-npx wrangler workflows trigger gateweave-backup '{"sources":["track"]}'
-npx wrangler workflows instances describe gateweave-backup latest
-npx wrangler d1 execute gateweave-backup --remote \
+npx wrangler workflows trigger my-backup '{"sources":["shop"]}'
+npx wrangler workflows instances describe my-backup latest
+npx wrangler d1 execute my-backup --remote \
   --command "SELECT source, status, snapshot, row_count, error FROM run ORDER BY started_at DESC LIMIT 5"
 ```
 
@@ -115,6 +126,8 @@ which names objects and steps, never data.
 Two runs may be going at once, such as one started by hand while the nightly one runs. A lock per
 source keeps them apart: the run that comes second fails that source with "Another run is backing
 up …", changes nothing, and alerts like any failed run. Start it again when the first has ended.
+
+Then restore it once, before you need to: [restore.md](restore.md).
 
 ## Restore tests
 
@@ -127,8 +140,8 @@ Set `JURISDICTION` to the bucket's jurisdiction (`"eu"` or `"fedramp"`), so rest
 too. To test now, add `"test": true` to a run, and read the outcome in the catalog:
 
 ```sh
-npx wrangler workflows trigger gateweave-backup '{"sources":["track"],"test":true}'
-npx wrangler d1 execute gateweave-backup --remote \
+npx wrangler workflows trigger my-backup '{"sources":["shop"],"test":true}'
+npx wrangler d1 execute my-backup --remote \
   --command "SELECT source, snapshot, status, row_count, error FROM restore_test ORDER BY tested_at DESC LIMIT 5"
 ```
 
@@ -136,10 +149,11 @@ A failed test fails the run, but the backup it tested stays.
 
 ## Alerts
 
-A run in which a backup or a restore test failed sends an alert, and so does the daily check
-(`triggers` in `wrangler.jsonc`, at 09:17 UTC) when a source's newest backup started over 26 hours
-ago, or hasn't ended after 5. The check counts on backups running every night. Every alert is kept
-in the catalog's `alert` table, sent or not; set up where they go, by email, by webhook or both.
+A run in which a backup, a restore test or a copy failed sends an alert, and so does the daily
+check (`triggers` in `wrangler.jsonc`, at 09:17 UTC) when a source's newest backup started over 26
+hours ago, or hasn't ended after 5. The check counts on backups running every night. Every alert is
+kept in the catalog's `alert` table, sent or not; set up where they go, by email, by webhook or
+both.
 
 **Email** needs [Email Service](https://developers.cloudflare.com/email-service/) sending from a
 domain of yours (`npx wrangler email sending enable example.com`). Add the binding and the sender
@@ -167,8 +181,8 @@ A setting that is there but wrong stops alerts, not backups, and the catalog say
 that alerts arrive, add `"alert": true` to a run, which sends one even if nothing failed:
 
 ```sh
-npx wrangler workflows trigger gateweave-backup '{"sources":["track"],"alert":true}'
-npx wrangler d1 execute gateweave-backup --remote \
+npx wrangler workflows trigger my-backup '{"sources":["shop"],"alert":true}'
+npx wrangler d1 execute my-backup --remote \
   --command "SELECT key, subject, sent_to, sent_at, error FROM alert ORDER BY made_at DESC LIMIT 5"
 ```
 
@@ -184,9 +198,9 @@ its `error`, and the daily check sends it again for three days.
 
 A bucket in your Cloudflare account doesn't survive the account being lost or misused, so each run
 can also copy every source's repository to an S3-compatible bucket at another provider, such as
-Backblaze B2, Hetzner Object Storage or Scaleway. It sends the sealed objects as they are in the
-vault, and only those the copy lacks: the provider sees chunk ids, snapshot times and sizes, never
-data, and the key stays with you.
+Backblaze B2, Hetzner Object Storage or Scaleway. It is off until `COPY_TO` names a bucket. It
+sends the sealed objects as they are in the vault, and only those the copy lacks: the provider
+sees chunk ids, snapshot times and sizes, never data, and the key stays with you.
 
 Make a bucket there, and a key that may list, read, write and delete in that bucket only. Then set
 where it is in `wrangler.jsonc`:
@@ -215,7 +229,7 @@ its chunks, and the next step or run goes on from what is there. The catalog's `
 row per source and run:
 
 ```sh
-npx wrangler d1 execute gateweave-backup --remote \
+npx wrangler d1 execute my-backup --remote \
   --command "SELECT source, status, object_count, size, snapshot_count, error FROM copy ORDER BY copied_at DESC LIMIT 5"
 ```
 
@@ -237,9 +251,18 @@ tests read the vault; to check the copy, point the CLI at it ([restore.md](resto
 [restore.md](restore.md): the CLI reads the bucket with a read-only R2 token and the key, and
 writes SQL for a new D1 database, or a bucket's objects to a folder.
 
+## An example of a real configuration: `env.gateweave`
+
+`wrangler.jsonc` also holds the configuration Gateweave Cloud's own backups run with, as the
+environment `gateweave`. It is there to read, as a deployment with every kind of source: five D1
+databases, three apps' Durable Objects through their `Backup` entrypoints and two buckets, in the
+EU jurisdiction, with a 21-day lock, a shorter retention to match a privacy policy, and email
+alerts. Its database ids and Worker names are Gateweave's, so `--env gateweave` deploys nowhere
+but there. Your own configuration goes at the top level, and you can delete `env` from your copy.
+
 ## What it can't do yet
 
-- D1, an app's Durable Objects and R2 buckets. KV comes next.
+- D1, an app's Durable Objects and R2 buckets. KV is not built.
 - A bucket's backup takes a Workflow step per 1,000 objects listed and per 100 objects or 256 MB
   read, so the first backup of a bucket of hundreds of thousands of objects takes too many steps
   for one run. Later runs read only what is new.
@@ -250,3 +273,6 @@ writes SQL for a new D1 database, or a bucket's objects to a folder.
 - A restore test holds the dump in memory once, as it was stored, while it loads. On Cloudflare a
   test of a 160 MB dump passed and one of 240 MB ran out of the Durable Object's memory (measured
   2026-11-12), so larger databases will need a test that restores them in parts.
+- An app's objects are listed in one Workflow step, whose result may be 1 MiB: some 25,000 objects
+  with names of 36 characters ([app-entrypoint.md](app-entrypoint.md#the-limits)).
+- There is no page: the catalog is read with `wrangler d1 execute`, as above.

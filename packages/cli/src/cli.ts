@@ -45,7 +45,7 @@ Usage:
 
 <repository> is a folder holding a copy of one (config.json, snapshots/, data/), or
 s3://<bucket>/<folder> for one in R2 or another S3-compatible bucket, such as
-s3://gateweave-backup/track.
+s3://my-backup/shop.
 [snapshot] is a name from \`snapshots\`, or latest (the default).
 
 The key:

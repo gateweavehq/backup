@@ -1,4 +1,5 @@
-// Gateweave Backup's Worker. It runs in the account whose data it backs up: see docs/deploy.md.
+// Gateweave Backup's Worker. It runs in the account whose data it backs up: see docs/deploy.md,
+// which says which of the names below to make your own.
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "gateweave-backup",
@@ -58,9 +59,9 @@
 		// Durable Objects a service binding to its Backup entrypoint in `services`, an R2 bucket a
 		// binding in `r2_buckets`, and each a name that never changes: it is the repository's folder
 		// in the bucket. For example:
-		// [{ "name": "track", "kind": "d1", "binding": "TRACK_DB" },
-		//  { "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
-		//  { "name": "track-files", "kind": "r2", "binding": "TRACK_FILES" }]
+		// [{ "name": "shop", "kind": "d1", "binding": "SHOP_DB" },
+		//  { "name": "shop-carts", "kind": "do", "binding": "SHOP_APP" },
+		//  { "name": "shop-files", "kind": "r2", "binding": "SHOP_FILES" }]
 		"SOURCES": [],
 		// The newest snapshot, then one a day for 7 days, a week for 4 weeks, a month for 12 months.
 		"RETENTION": "1l 7d 4w 12m",
@@ -89,7 +90,9 @@
 		"required": ["BACKUP_KEY"]
 	},
 	"env": {
-		// Gateweave Cloud's own backups: `npx wrangler deploy --env gateweave`. The bucket is in the EU
+		// An example of a real configuration: Gateweave Cloud's own backups, which its operator
+		// deploys with `npx wrangler deploy --env gateweave`. Its ids are Gateweave's, so it deploys
+		// nowhere else; yours goes at the top level (docs/deploy.md). The bucket is in the EU
 		// jurisdiction and locked for 21 days. Gateweave's privacy policy says recovery copies last up
 		// to 30 days, so nothing is kept longer: 7 days and 3 weeks of snapshots, then at most a day
 		// for the next prune, plus whatever the lock still holds, stays under it.
@@ -172,7 +175,7 @@
 					// Guard's tokens are sealed under its own SECRETS_KEY, so a restore needs that key too.
 					{ "name": "guard", "kind": "d1", "binding": "GUARD_DB" },
 					// Mail's provider keys in D1, its webhooks' secrets and its raw mail are sealed under
-					// Mail's own SECRETS_KEY, so a restore needs that key too: docs/restore.md, "Mail".
+					// Mail's own SECRETS_KEY, so a restore needs that key too: docs/restore.md, "A worked example".
 					{ "name": "mail", "kind": "d1", "binding": "MAIL_DB" },
 					{ "name": "track-workspaces", "kind": "do", "binding": "TRACK_APP" },
 					{ "name": "agents-workspaces", "kind": "do", "binding": "AGENTS_APP" },
@@ -184,7 +187,8 @@
 				"RESTORE_TEST_DAYS": "30",
 				"JURISDICTION": "eu",
 				"ALERT_FROM": "Gateweave Backup <backup@gateweave.com>",
-				// No copy outside Cloudflare yet: choosing its provider is the owner's call (WEB-35).
+				// The copy outside Cloudflare is a setting, and which provider holds this deployment's
+				// is its operator's to choose, not this file's.
 				"COPY_TO": "",
 				"COPY_ENDPOINT": "",
 				"COPY_REGION": ""

@@ -43,6 +43,7 @@ import {
 	objectReader,
 	R2Store,
 } from "../src/bindings";
+import { releaseLock, takeLock } from "../src/catalog";
 import { CopyConfigError, copyNew, copyTarget } from "../src/copy";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
@@ -380,6 +381,50 @@ describe("a backup run", () => {
 			until,
 		});
 		expect((await env.VAULT.list({ prefix: "app/" })).objects).toEqual([]);
+	});
+
+	it("gives a source's lock to one of two runs that ask at once, and again to the one that has it", async () => {
+		// The lock is all that keeps two runs apart: the Workflow has no limit on its instances.
+		const now = Date.now();
+		const took = await Promise.all(
+			["one", "two", "three"].map((holder) => takeLock(env.CATALOG, "app", holder, now)),
+		);
+		expect(took.filter(Boolean)).toHaveLength(1);
+		const holder = ["one", "two", "three"][took.indexOf(true)] ?? "";
+		expect((await env.CATALOG.prepare("SELECT holder FROM lock").all()).results).toEqual([
+			{ holder },
+		]);
+		// A step that took it and is tried again still has it; nobody else gets it meanwhile.
+		expect(await takeLock(env.CATALOG, "app", holder, now + 1000)).toBe(true);
+		expect(await takeLock(env.CATALOG, "app", "four", now + 2000)).toBe(false);
+		// Another source's lock is its own.
+		expect(await takeLock(env.CATALOG, "objects", "four", now)).toBe(true);
+		// Letting go of a lock one doesn't hold changes nothing; the holder's frees it.
+		await releaseLock(env.CATALOG, "app", "four");
+		expect(await takeLock(env.CATALOG, "app", "four", now + 3000)).toBe(false);
+		await releaseLock(env.CATALOG, "app", holder);
+		expect(await takeLock(env.CATALOG, "app", "four", now + 4000)).toBe(true);
+	});
+
+	it("keeps two runs started together apart, whichever comes first", async () => {
+		const [first, second] = await Promise.all([
+			backUp("by-hand", { sources: ["app"] }),
+			backUp("nightly", { sources: ["app"] }),
+		]);
+		// Either one waited its turn without knowing it, or one found the lock held and left the
+		// source alone. Nothing else may happen: every run that says ok made a snapshot of its own.
+		const ended = await runs();
+		expect(ended).toHaveLength(2);
+		const ok = ended.filter((run) => run.status === "ok");
+		expect(ok.length).toBeGreaterThan(0);
+		for (const run of ended) {
+			if (run.status !== "ok") {
+				expect(run).toMatchObject({ status: "failed", error: "Another run is backing up app." });
+			}
+		}
+		expect([first.ended, second.ended].filter((end) => end === "complete")).toHaveLength(ok.length);
+		expect(await (await repository()).snapshots()).toHaveLength(ok.length);
+		expect((await env.CATALOG.prepare("SELECT * FROM lock").all()).results).toEqual([]);
 	});
 
 	it("takes over a lock whose run died", async () => {

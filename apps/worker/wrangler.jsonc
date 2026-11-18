@@ -40,10 +40,12 @@
 			"binding": "BACKUP",
 			"class_name": "BackupWorkflow",
 			// Every night at 03:17 UTC, away from the top of the hour when crons crowd.
-			"schedules": ["17 3 * * *"],
-			// One run at a time. A run also takes a lock per source, since scheduled instances may
-			// start past this limit.
-			"concurrency": { "limit": 1 }
+			// No `concurrency` limit: a lock per source in the catalog keeps two runs apart, and the
+			// second fails that source with "Another run is backing up …" and touches nothing. A limit
+			// of 1 stood here from 2026-11-14 to 2026-11-18. Under it the nightly runs went on, since
+			// scheduled instances don't count towards it, but every run started by hand
+			// (`wrangler workflows trigger`) stayed queued for good, with nothing else running.
+			"schedules": ["17 3 * * *"]
 		}
 	],
 	// The daily check, six hours after the nightly run: it alerts when a source's backup is late
@@ -155,8 +157,8 @@
 					"name": "gateweave-backup",
 					"binding": "BACKUP",
 					"class_name": "BackupWorkflow",
-					"schedules": ["17 3 * * *"],
-					"concurrency": { "limit": 1 }
+					// No `concurrency` limit, as above: the lock per source keeps runs apart.
+					"schedules": ["17 3 * * *"]
 				}
 			],
 			"triggers": { "crons": ["17 9 * * *"] },

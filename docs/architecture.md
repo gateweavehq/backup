@@ -105,7 +105,12 @@ section is still to come where it says so.
 - **A lock per source.** Pruning deletes the chunks no manifest names, so it must never meet a run
   that has found a chunk stored and not yet written its manifest. A run takes the source's lock
   before its first write and gives it back after its last; one that dies frees it after 12 hours.
-  The Workflow also runs one instance at a time, but scheduled instances may start past that limit.
+  A run that finds the lock held fails that source at once, saying another run is backing it up,
+  writes nothing and leaves the lock with its holder; its other sources go on, and the run ends
+  as failed and alerts. The lock is all that keeps runs apart. The Workflow had a limit of one
+  instance at a time as well, from 2026-11-14 to 2026-11-18: scheduled instances never counted
+  towards it, and under it every run started by hand stayed queued for good while nothing else
+  ran, so it went.
 - **Retention:** the newest snapshot, then 7 daily, 4 weekly and 12 monthly by default. Pruning
   forgets manifests first, then deletes the chunks nothing points to. The snapshot a run just made
   always stays.

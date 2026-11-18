@@ -112,6 +112,10 @@ npx wrangler d1 execute gateweave-backup --remote \
 A run with no `sources` backs up all of them. One that fails says why in the catalog's `error`,
 which names objects and steps, never data.
 
+Two runs may be going at once, such as one started by hand while the nightly one runs. A lock per
+source keeps them apart: the run that comes second fails that source with "Another run is backing
+up …", changes nothing, and alerts like any failed run. Start it again when the first has ended.
+
 ## Restore tests
 
 Every `RESTORE_TEST_DAYS` days (30 by default), a run restores the snapshot it has just made into a

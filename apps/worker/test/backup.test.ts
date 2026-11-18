@@ -6,16 +6,22 @@ import {
 import { env, exports } from "cloudflare:workers";
 import {
 	type BucketObject,
+	type ChunkerParams,
 	concat,
+	deriveKeys,
 	dumpSqlite,
+	fromHex,
 	fromUtf8,
 	generateMasterKey,
 	joinLines,
 	type ObjectStore,
+	parseMasterKey,
 	Repository,
 	readBucketIndex,
 	restoreSql,
+	seal,
 	splitLines,
+	toBase64Url,
 	utf8,
 	writeBucketIndex,
 } from "@gateweave/backup-core";
@@ -874,6 +880,26 @@ async function testerTables(source: string) {
 }
 
 /** A repository for `source` holding one snapshot of `lines`, as a backup would write it. */
+/**
+ * A repository with the id given, where `Repository.init` would draw one: its `config.json`
+ * written as docs/format.md describes it, then opened as any other. The chunker's table comes from
+ * the key and the id, so the same bytes are cut at the same places in every run.
+ */
+async function repositoryWithId(store: ObjectStore, id: string, chunker: ChunkerParams) {
+	const keys = await deriveKeys(parseMasterKey(env.BACKUP_KEY), fromHex(id));
+	const check = toBase64Url(await seal(keys, `config:${id}`, utf8("gateweave-backup")));
+	const config = {
+		format: "gateweave-backup",
+		version: 1,
+		id,
+		created: "2026-11-18T00:00:00.000Z",
+		chunker,
+		check,
+	};
+	await store.put("config.json", utf8(`${JSON.stringify(config, null, "\t")}\n`));
+	return Repository.open(store, env.BACKUP_KEY);
+}
+
 async function commitDump(source: string, lines: string[]) {
 	const repo = await Repository.init(new R2Store(env.VAULT, `${source}/`), env.BACKUP_KEY);
 	const { entry } = await repo.writeFile("database.jsonl", utf8(joinLines(lines)));
@@ -1058,13 +1084,17 @@ describe("restore tests", () => {
 	});
 
 	it("restore a dump cut into many chunks, between lines and inside characters", async () => {
-		// Irregular text, so the chunks' cuts don't fall in the same place in every row.
+		// Irregular text, so the chunks' cuts don't fall in the same place in every row. The letters
+		// come from a small generator with a seed of its own: a formula of the row and the column
+		// repeats every few letters, and then every cut can fall at the same place in the pattern.
 		const letters = [..."ğüşıöç aeß🙂"];
+		let seed = 20261118;
+		const next = () => {
+			seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+			return seed >>> 16;
+		};
 		const note = (i: number) =>
-			Array.from(
-				{ length: 300 + i * 11 },
-				(_, j) => letters[(i * 7 + j * j * 31 + j) % letters.length],
-			).join("");
+			Array.from({ length: 300 + i * 11 }, () => letters[next() % letters.length]).join("");
 		await env.SOURCE_DB.batch(
 			Array.from({ length: 60 }, (_, i) =>
 				env.SOURCE_DB.prepare("INSERT INTO person (id, email, note) VALUES (?1, ?2, ?3)").bind(
@@ -1075,9 +1105,14 @@ describe("restore tests", () => {
 			),
 		);
 		const { lines } = await dumpSqlite(d1Reader(env.SOURCE_DB));
-		const repo = await Repository.init(new R2Store(env.VAULT, "chunked/"), env.BACKUP_KEY, {
-			chunker: { min: 128, avg: 512, max: 2048 },
-		});
+		// The cuts depend on the repository's id, which is random, so this one's is given: the same
+		// text is cut at the same places every time, and what is asked of the cuts below holds or
+		// fails for good.
+		const repo = await repositoryWithId(
+			new R2Store(env.VAULT, "chunked/"),
+			"5eed0000c0ffee00000000000000cdc1",
+			{ min: 128, avg: 512, max: 2048 },
+		);
 		const { entry } = await repo.writeFile("database.jsonl", utf8(joinLines(lines)));
 		const chunks = await repo.readFileChunks(entry);
 		expect(chunks.length).toBeGreaterThan(20);

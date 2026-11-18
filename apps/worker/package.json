@@ -16,6 +16,7 @@
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-plugin": "catalog:",
+		"esbuild": "catalog:",
 		"typescript": "catalog:",
 		"vitest": "catalog:",
 		"wrangler": "catalog:"

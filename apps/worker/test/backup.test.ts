@@ -26,6 +26,7 @@ import {
 	writeBucketIndex,
 } from "@gateweave/backup-core";
 import { beforeEach, describe, expect, it } from "vitest";
+import guide from "../../../docs/app-entrypoint.md?raw";
 import worker from "../src";
 import { when } from "../src/alert-message";
 import {
@@ -40,6 +41,8 @@ import {
 	type BackupService,
 	d1Reader,
 	describeObject,
+	listObjects,
+	ObjectGone,
 	objectReader,
 	R2Store,
 } from "../src/bindings";
@@ -47,6 +50,8 @@ import { releaseLock, takeLock } from "../src/catalog";
 import { CopyConfigError, copyNew, copyTarget } from "../src/copy";
 import { testerFor, testInterval } from "../src/restore-test";
 import type { BackupParams } from "../src/workflow";
+import { type Backup as ExampleBackup, refusal } from "./example-app";
+import exampleSource from "./example-app.ts?raw";
 
 const PEOPLE = [
 	"INSERT INTO person (id, email, note, big, avatar) VALUES (1, 'ada@example.com', 'first line\nsecond', 9007199254740993, X'00ff10')",
@@ -484,6 +489,132 @@ describe("a database too large for one read", () => {
 		expect(pages.lines).toEqual(object.lines);
 		expect(pages.stats).toEqual({ ...object.stats, consistent: true });
 		expect(object.stats.rows).toBe(40);
+	});
+});
+
+/** The text between the guide's first ```ts fence and its end, and the example file's region. */
+function exampleIn(text: string, start: RegExp, end: RegExp): string {
+	const lines = text.replaceAll("\r\n", "\n").split("\n");
+	const from = lines.findIndex((line) => start.test(line));
+	const to = lines.findIndex((line, i) => i > from && end.test(line));
+	if (from < 0 || to < 0) throw new Error("The example isn't marked.");
+	return lines.slice(from + 1, to).join("\n");
+}
+
+describe("the example app of docs/app-entrypoint.md", () => {
+	const example = (env as unknown as { EXAMPLE: BackupService }).EXAMPLE;
+	const id = (i: number) => `nb-${String(i).padStart(3, "0")}`;
+
+	it("is the code the guide shows, word for word", () => {
+		const shown = exampleIn(guide, /^```ts$/, /^```$/);
+		expect(shown).toBe(
+			exampleIn(exampleSource, /^\/\/ #region example$/, /^\/\/ #endregion example$/),
+		);
+		expect(shown).toContain("export class Backup extends WorkerEntrypoint");
+	});
+
+	it("is an app a backup can read: the entrypoint is what the Worker asks for", () => {
+		// Checked when the tests are type-checked: the example's entrypoint has the contract's shape.
+		const asked: (entrypoint: ExampleBackup) => BackupService = (entrypoint) => entrypoint;
+		expect(asked).toBeTypeOf("function");
+	});
+
+	it("lists every notebook once, in order, over more than one page", async () => {
+		const ids = Array.from({ length: 205 }, (_, i) => id(i));
+		// Listed out of order, so the order is the entrypoint's. The other tests' notebooks go first:
+		// the example app's storage is its own Worker's, and isn't put back between tests.
+		await env.EXAMPLE_SEED.clear();
+		await env.EXAMPLE_SEED.list([...ids].reverse());
+		const first = await example.objects();
+		expect(first.names).toEqual(ids.slice(0, 100));
+		expect(first.cursor).toBe(id(99));
+		expect(await listObjects(example)).toEqual(ids);
+		const refused = await example.objects("not a cursor;").catch((error: unknown) => error);
+		expect(String(refused)).toContain("That is not a cursor.");
+	});
+
+	it("gives a dump that restores to the same rows, read whole and a page at a time", async () => {
+		const bodies = Array.from({ length: 40 }, (_, i) => `it's note ${i}, ğüş 🙂 ${"x".repeat(i)}`);
+		await env.EXAMPLE_SEED.write("nb-dump", bodies);
+		const whole = await dumpSqlite(objectReader(example, "nb-dump"));
+		const paged = await dumpSqlite(objectReader(example, "nb-dump"), { pageChars: 300 });
+		expect(paged.lines).toEqual(whole.lines);
+		expect(whole.stats).toEqual({ tables: 1, rows: 40, empty: [], consistent: true });
+		await env.RESTORE_DB.batch(
+			[...restoreSql(whole.lines)].map((statement) => env.RESTORE_DB.prepare(statement)),
+		);
+		const restored = await env.RESTORE_DB.prepare("SELECT body FROM note ORDER BY id").all();
+		expect(restored.results.map((row) => row.body)).toEqual(bodies);
+	});
+
+	it("answers null for a notebook that isn't listed, and makes none by being asked", async () => {
+		await env.EXAMPLE_SEED.write("nb-gone", ["soon gone"]);
+		expect(await example.read("nb-gone", ["SELECT body FROM note"])).toEqual([
+			[{ body: "soon gone" }],
+		]);
+		await env.EXAMPLE_SEED.remove("nb-gone");
+		expect(await example.read("nb-gone", ["SELECT body FROM note"])).toBeNull();
+		expect(await example.read("nb-never", ["SELECT 1"])).toBeNull();
+		expect(await example.read("../nb-dump", ["SELECT 1"])).toBeNull();
+		await expect(dumpSqlite(objectReader(example, "nb-gone"))).rejects.toBeInstanceOf(ObjectGone);
+	});
+
+	it("refuses what isn't a read, and says why without the statement", async () => {
+		await env.EXAMPLE_SEED.write("nb-guard", ["kept"]);
+		const refused = [
+			["DELETE FROM note"],
+			["SELECT 1; DELETE FROM note"],
+			["PRAGMA writable_schema = 1"],
+			["  WITH gone AS (SELECT 1) DELETE FROM note"],
+			["SELECT 1", "DROP TABLE note"],
+		];
+		for (const statements of refused) {
+			const error = await example.read("nb-guard", statements).catch((e: unknown) => e);
+			expect(String(error), statements.join()).toContain("The notebook refused the backup's read.");
+			expect(String(error)).not.toMatch(/DELETE|DROP|writable|FROM/);
+		}
+		expect(await example.read("nb-guard", ["SELECT body FROM note"])).toEqual([[{ body: "kept" }]]);
+	});
+
+	it("lets in every statement a dump sends, and counts what it takes", async () => {
+		// The statements of a whole read and of a paged one, from a database with what dumps meet:
+		// an AUTOINCREMENT counter, a full-text index and a table without a rowid.
+		await env.SOURCE_DB.batch(
+			[
+				"CREATE TABLE entry (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)",
+				'CREATE TABLE "odd name" (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID',
+				"CREATE VIRTUAL TABLE entry_search USING fts5 (body)",
+				`INSERT INTO entry (body) VALUES ${Array.from({ length: 30 }, (_, i) => `('entry ${i}')`).join(", ")}`,
+				"INSERT INTO entry_search (body) VALUES ('found')",
+			].map((sql) => env.SOURCE_DB.prepare(sql)),
+		);
+		const sent: string[][] = [];
+		const reader = d1Reader(env.SOURCE_DB);
+		const listening = {
+			readTogether(statements: string[]) {
+				sent.push(statements);
+				return reader.readTogether(statements);
+			},
+		};
+		await dumpSqlite(listening);
+		await dumpSqlite(listening, { pageChars: 200 });
+		expect(sent.length).toBeGreaterThan(8);
+		for (const statements of sent)
+			expect(refusal(statements), statements.join("\n")).toBeUndefined();
+		expect(sent.flat().some((sql) => sql.startsWith("PRAGMA table_info"))).toBe(true);
+		expect(sent.flat().some((sql) => sql.includes("total_changes()"))).toBe(true);
+
+		// A database with no table of its own gets an empty call for its tables' columns.
+		expect(refusal([])).toBeUndefined();
+		expect(refusal(Array.from({ length: 1000 }, () => "SELECT 1"))).toBeUndefined();
+		expect(refusal(Array.from({ length: 1001 }, () => "SELECT 1"))).toBe(
+			"Too many statements at once.",
+		);
+		expect(refusal([`SELECT '${"x".repeat(100_000)}'`])).toBe("A statement is too long.");
+		expect(refusal("SELECT 1")).toBe("Not a list of statements.");
+		expect(refusal(["select 1", " PRAGMA table_xinfo(note)", "pragma TABLE_LIST"])).toBeUndefined();
+		expect(refusal(["PRAGMA table_information"])).toBeDefined();
+		expect(refusal(["SELECTED"])).toBeDefined();
 	});
 });
 

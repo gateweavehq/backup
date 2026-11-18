@@ -1,0 +1,60 @@
+name: Bug report
+description: Something does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste the backup key, a token or anything a backup holds. The catalog's errors and
+        the CLI's messages name objects and steps, never data, so they are safe to share.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `npx wrangler workflows trigger …`
+        2. …
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - The Worker (a backup run, a restore test, the copy, an alert)
+        - The restore CLI
+        - The documentation
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Kind of source
+      description: D1, an app's Durable Objects or an R2 bucket, and about how large it is.
+      placeholder: A D1 database of 300 MB
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release or commit you are running.
+  - type: input
+    id: environment
+    attributes:
+      label: Wrangler, Node.js and OS
+      placeholder: Wrangler 4.158, Node.js 24 on macOS 16
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        The catalog's `error` for the run (docs/deploy.md, "Run one now, and check it"), the output
+        of `wrangler workflows instances describe`, or what the CLI printed.
+      render: text

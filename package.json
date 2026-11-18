@@ -17,7 +17,7 @@
 		"build": "pnpm -r build"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.6.5",
+		"@biomejs/biome": "2.6.7",
 		"typescript": "catalog:"
 	}
 }

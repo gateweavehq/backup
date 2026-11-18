@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/logo.svg" width="96" height="96" alt="">
+</p>
+
 <h1 align="center">Gateweave Backup</h1>
 
 <p align="center">

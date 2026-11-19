@@ -9,6 +9,10 @@ Open an issue before anything large, and before anything that touches the reposi
 what you have in mind, so nobody does it twice and the design is agreed before the work. Small
 fixes, to the code or the documentation, can come straight as a pull request.
 
+Issues labelled [good first issue](https://github.com/gateweavehq/backup/labels/good%20first%20issue)
+are small: [see the open ones](https://github.com/gateweavehq/backup/issues?q=is%3Aopen+label%3A%22good+first+issue%22).
+Say in the issue that you're taking one.
+
 ## Setup
 
 You need Node.js 24 (see `.node-version`; 22.13 or later works) and pnpm 12. Nothing else: the

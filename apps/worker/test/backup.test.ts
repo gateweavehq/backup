@@ -4,6 +4,7 @@ import {
 	runInDurableObject,
 } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
+import * as core from "@gateweave/backup-core";
 import {
 	type BucketObject,
 	type ChunkerParams,
@@ -25,10 +26,11 @@ import {
 	utf8,
 	writeBucketIndex,
 } from "@gateweave/backup-core";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import guide from "../../../docs/app-entrypoint.md?raw";
 import worker from "../src";
 import { when } from "../src/alert-message";
+import * as alerting from "../src/alerts";
 import {
 	type Alert,
 	checkBackups,
@@ -634,6 +636,7 @@ describe("an app's Durable Objects", () => {
 				},
 			],
 		});
+		expect(await alerts()).toEqual([]);
 
 		const repo = await repository("objects");
 		const [name] = await repo.snapshots();
@@ -854,6 +857,7 @@ describe("an R2 bucket", () => {
 				},
 			],
 		});
+		expect(await alerts()).toEqual([]);
 
 		const repo = await repository("files");
 		const [name] = await repo.snapshots();
@@ -1664,6 +1668,129 @@ describe("alerts", () => {
 				sent_to: "",
 			}),
 		]);
+	});
+
+	it("reports unverified SQLite consistency in one automatic run alert", async () => {
+		const table = "CREATE TABLE consistency_probe (body TEXT)";
+		const row = "INSERT INTO consistency_probe VALUES ('private-row-sentinel')";
+		await env.SOURCE_DB.batch([table, row].map((sql) => env.SOURCE_DB.prepare(sql)));
+		await env.APP_SEED.add("private-object-a", [table, row]);
+		await env.APP_SEED.add("private-object-b", [table, row]);
+		await env.APP_SEED.add("private-object-stable", [
+			...NOTES,
+			"INSERT INTO note VALUES (1, 'stable')",
+		]);
+
+		// Use real SQLite rows and the default retry/fallback logic with a small page size.
+		// A changed page counter stands in for writes interleaved with the Workflow's reads.
+		const dump = core.dumpSqliteTo;
+		using spy = vi.spyOn(core, "dumpSqliteTo").mockImplementation((reader, write) =>
+			dump(
+				{
+					async readTogether(statements) {
+						const results = await reader.readTogether(statements);
+						if (
+							statements[0]?.includes('FROM "consistency_probe"') &&
+							statements[0].includes(" LIMIT ")
+						) {
+							results[1] = [{ t: Number(results[1]?.[0]?.t) + 1 }];
+						}
+						return results;
+					},
+				},
+				write,
+				{ pageChars: 16 },
+			),
+		);
+		const { binding, sent } = mailbox();
+		const email = {
+			EMAIL: binding,
+			ALERT_FROM: "Gateweave Backup <backup@gateweave.com>",
+			ALERT_TO: "owner@example.com",
+		} satisfies Pick<Env, "EMAIL" | "ALERT_FROM" | "ALERT_TO">;
+		const send = alerting.sendAlert;
+		using sender = vi
+			.spyOn(alerting, "sendAlert")
+			.mockImplementation((context, alert) => send({ ...context, ...email }, alert));
+		const result = await backUp("unverified", { sources: ["app", "objects", "files"] });
+		expect(spy).toHaveBeenCalled();
+		const [d1, objects] = await Promise.all([repository(), repository("objects")]);
+		const [d1Name] = await d1.snapshots();
+		const [objectsName] = await objects.snapshots();
+		if (!d1Name || !objectsName) throw new Error("The SQLite snapshots weren't made.");
+		expect((await d1.manifest(d1Name)).meta).toEqual({
+			tables: 2,
+			rows: 4,
+			empty: [],
+			consistent: false,
+		});
+		expect((await objects.manifest(objectsName)).meta).toEqual({
+			objects: 3,
+			tables: 4,
+			rows: 3,
+			empty: [],
+			inconsistent: ["private-object-a", "private-object-b"],
+		});
+		expect(result).toEqual({
+			ended: "complete",
+			output: [
+				{
+					source: "app",
+					status: "ok",
+					snapshot: d1Name,
+					test: "passed",
+					copy: "ok",
+					consistencyWarning: { kind: "d1" },
+				},
+				{
+					source: "objects",
+					status: "ok",
+					snapshot: objectsName,
+					test: "passed",
+					copy: "ok",
+					consistencyWarning: { kind: "do", affectedObjects: 2 },
+				},
+				{
+					source: "files",
+					status: "ok",
+					snapshot: expect.stringMatching(/^\d{8}T/),
+					test: "passed",
+					copy: "ok",
+				},
+			],
+		});
+
+		const recorded = await alerts();
+		expect(recorded).toEqual([
+			expect.objectContaining({
+				key: "run:unverified",
+				subject: "Gateweave Backup: point-in-time consistency was not verified",
+				sent_at: expect.any(Number),
+				sent_to: "email",
+				error: null,
+			}),
+		]);
+		for (const body of [String(recorded[0]?.text), String(recorded[0]?.html)]) {
+			expect(body).toContain(
+				`Snapshot ${d1Name}, restored and counted by a restore test, and copied outside Cloudflare. Point-in-time consistency was not verified for this database.`,
+			);
+			expect(body).toContain(
+				`Snapshot ${objectsName}, restored and counted by a restore test, and copied outside Cloudflare. Point-in-time consistency was not verified for 2 Durable Objects.`,
+			);
+			expect(body.match(/Point-in-time consistency was not verified for/g)).toHaveLength(2);
+			expect(body).not.toMatch(/private-object|private-row|consistency_probe/);
+		}
+		expect(sender).toHaveBeenCalledTimes(1);
+		const message = {
+			subject: String(recorded[0]?.subject),
+			text: String(recorded[0]?.text),
+			html: String(recorded[0]?.html),
+		};
+		await expect(
+			send({ ...env, ...email }, { key: "run:unverified", ...message }),
+		).resolves.toEqual([]);
+		expect(sent).toEqual([expect.objectContaining(message)]);
+		expect(await alerts()).toEqual(recorded);
 	});
 
 	it("that can't be sent stay in the catalog and go the next morning", async () => {

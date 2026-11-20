@@ -4,6 +4,7 @@ import { Chunker, type ChunkerParams } from "../src/cdc";
 import { deriveKeys, generateMasterKey, parseMasterKey } from "../src/keys";
 
 const small: ChunkerParams = { min: 2048, avg: 8192, max: 32768 };
+const EDIT_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 async function gear(master = generateMasterKey()) {
 	return (await deriveKeys(parseMasterKey(master), fromHex("00112233445566778899aabbccddeeff")))
@@ -64,7 +65,11 @@ describe("the chunker", () => {
 	});
 
 	it("changes only the chunks around an edit", async () => {
-		const g = await gear();
+		// The cuts depend on the key. With a random one, an edit now and then lands in a stretch with
+		// no cut of its own, and the cuts forced at the largest size shift until the next natural one:
+		// more than three new chunks for about one key in three hundred. A fixed key keeps this exact,
+		// and a chunker that never found its cuts again would still change dozens here.
+		const g = await gear(EDIT_KEY);
 		const data = sample(500_000);
 		const edited = concat(
 			data.subarray(0, 250_000),

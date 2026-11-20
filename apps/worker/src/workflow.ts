@@ -78,6 +78,8 @@ export interface SourceResult {
 	source: string;
 	status: "ok" | "failed";
 	snapshot?: string;
+	/** The SQLite dump fell back to a paged read whose point-in-time consistency was unverified. */
+	consistencyWarning?: { kind: "d1" } | { kind: "do"; affectedObjects: number };
 	/** How the restore test of the new snapshot went, when there was one. */
 	test?: "passed" | "failed";
 	error?: string;
@@ -86,6 +88,10 @@ export interface SourceResult {
 	/** How the copy outside Cloudflare went, when COPY_TO names one. */
 	copy?: "ok" | "failed";
 	copyError?: string;
+}
+
+interface BackupRecord extends SnapshotRecord {
+	consistencyWarning?: SourceResult["consistencyWarning"];
 }
 
 /** Catalog writes are small, and D1 hiccups pass. */
@@ -174,7 +180,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				: []),
 		];
 		const asked = event.payload?.alert === true;
-		if (problems.length > 0 || asked) {
+		if (problems.length > 0 || asked || results.some((r) => r.consistencyWarning)) {
 			await this.#alert(() => runAlert(event.instanceId, results, asked, new Date()), step);
 		}
 		// A run that made every snapshot but couldn't restore one shows as failed too.
@@ -222,19 +228,21 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			startRun(db, { id, instance, source: name, at: Date.now() }),
 		);
 		let snapshot: string | undefined;
+		let consistencyWarning: SourceResult["consistencyWarning"];
 		try {
 			await step.do(`${name}: lock`, QUICK, async () => {
 				if (!(await takeLock(db, name, instance, Date.now()))) {
 					throw new NonRetryableError(`Another run is backing up ${name}.`);
 				}
 			});
-			const record =
+			const record: BackupRecord =
 				source.kind === "d1"
 					? await step.do(`${name}: back up`, HEAVY, () => this.#snapshot(source))
 					: source.kind === "do"
 						? await this.#snapshotObjects(source, step)
 						: await this.#snapshotBucket(source, step);
 			snapshot = record.name;
+			consistencyWarning = record.consistencyWarning;
 			await step.do(`${name}: record`, QUICK, () => recordSnapshot(db, id, record));
 			const made = record.name;
 			const pruned = await step.do(`${name}: prune`, HEAVY, () => this.#prune(source, made));
@@ -247,6 +255,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				await releaseLock(db, name, instance);
 			});
 			const result: SourceResult = { source: name, status: "ok", snapshot };
+			if (consistencyWarning) result.consistencyWarning = consistencyWarning;
 			if (test) result.test = test.passed ? "passed" : "failed";
 			if (test?.error) result.testError = test.error;
 			if (copy) result.copy = copy.ok ? "ok" : "failed";
@@ -259,7 +268,13 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				await failRun(db, { id, at: Date.now(), error: message });
 				await releaseLock(db, name, instance);
 			});
-			return { source: name, status: "failed", snapshot, error: message };
+			return {
+				source: name,
+				status: "failed",
+				snapshot,
+				error: message,
+				...(consistencyWarning && { consistencyWarning }),
+			};
 		}
 	}
 
@@ -369,7 +384,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	 * Backs up an app's Durable Objects: lists them, dumps them some at a time, one step each, then
 	 * commits one snapshot that holds every dump. An object deleted since it was listed is left out.
 	 */
-	async #snapshotObjects(source: ObjectsSource, step: WorkflowStep): Promise<SnapshotRecord> {
+	async #snapshotObjects(source: ObjectsSource, step: WorkflowStep): Promise<BackupRecord> {
 		const name = source.name;
 		const names = await step.do(`${name}: list`, QUICK, () => listObjects(this.#service(source)));
 		const batches: string[][] = [];
@@ -381,7 +396,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			const label = `${name}: back up ${i + 1} of ${batches.length}`;
 			parts.push(...(await step.do(label, HEAVY, () => this.#dumpObjects(source, batch))));
 		}
-		return step.do(`${name}: commit`, QUICK, async () => {
+		return step.do(`${name}: commit`, QUICK, async (): Promise<BackupRecord> => {
 			const repo = await this.#repository(source);
 			const tables = parts.reduce((sum, part) => sum + part.tables, 0);
 			const rows = parts.reduce((sum, part) => sum + part.rows, 0);
@@ -407,6 +422,9 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 				size: entries.reduce((sum, entry) => sum + entry.size, 0),
 				newBytes: parts.reduce((sum, part) => sum + part.newBytes, 0),
 				empty,
+				...(inconsistent.length > 0 && {
+					consistencyWarning: { kind: "do", affectedObjects: inconsistent.length },
+				}),
 			};
 		});
 	}
@@ -624,7 +642,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 	}
 
 	/** Dumps the source and commits the dump as a snapshot. */
-	async #snapshot(source: D1Source): Promise<SnapshotRecord> {
+	async #snapshot(source: D1Source): Promise<BackupRecord> {
 		const binding = (this.env as unknown as Record<string, unknown>)[source.binding];
 		if (!isD1(binding)) {
 			throw new NonRetryableError(
@@ -650,6 +668,7 @@ export class BackupWorkflow extends WorkflowEntrypoint<Env, BackupParams | undef
 			size: entry.size,
 			newBytes: stats.newBytes,
 			empty: dump.stats.empty,
+			...(!dump.stats.consistent && { consistencyWarning: { kind: "d1" } }),
 		};
 	}
 

@@ -206,7 +206,7 @@ function compose(key: string, message: AlertMessage, suffix = ""): Alert {
 	return { key, subject, text: renderText(message), html: renderHtml(message, subject) };
 }
 
-/** The alert for a run that failed somewhere, or that asked for one: how every source fared. */
+/** The alert for a run with a failure or warning, or that asked for one. */
 export function runAlert(
 	instance: string,
 	results: SourceResult[],
@@ -222,14 +222,24 @@ export function runAlert(
 		...(uncopied.length > 0 ? [`the copy of ${list(uncopied)} outside Cloudflare failed`] : []),
 	];
 	const items = results.map((r): AlertItem => {
-		const { source } = r;
+		const { source, consistencyWarning } = r;
+		const withWarning = (detail: string): string => {
+			if (!consistencyWarning) return detail;
+			const affected =
+				consistencyWarning.kind === "d1"
+					? "this database"
+					: `${consistencyWarning.affectedObjects} Durable ${consistencyWarning.affectedObjects === 1 ? "Object" : "Objects"}`;
+			return `${detail} Point-in-time consistency was not verified for ${affected}.`;
+		};
 		if (r.status === "failed") {
-			const detail = "The backup failed. The snapshots made before it stay.";
+			const detail = withWarning("The backup failed. The snapshots made before it stay.");
 			return { source, label: "Failed", tone: "bad", detail, ...(r.error && { error: r.error }) };
 		}
 		const snapshot = `Snapshot ${r.snapshot ?? ""}`;
 		if (r.test === "failed") {
-			const detail = `${snapshot} was made, but restoring it failed. The snapshot stays.`;
+			const detail = withWarning(
+				`${snapshot} was made, but restoring it failed. The snapshot stays.`,
+			);
 			return {
 				source,
 				label: "Test failed",
@@ -240,7 +250,9 @@ export function runAlert(
 		}
 		const tested = r.test === "passed" ? ", restored and counted by a restore test" : "";
 		if (r.copy === "failed") {
-			const detail = `${snapshot} was made${tested}, but copying it outside Cloudflare failed. It is in the vault.`;
+			const detail = withWarning(
+				`${snapshot} was made${tested}, but copying it outside Cloudflare failed. It is in the vault.`,
+			);
 			return {
 				source,
 				label: "Copy failed",
@@ -250,24 +262,32 @@ export function runAlert(
 			};
 		}
 		const copied = r.copy === "ok" ? `${tested ? "," : ""} and copied outside Cloudflare` : "";
-		return { source, label: "Backed up", tone: "good", detail: `${snapshot}${tested}${copied}.` };
+		return {
+			source,
+			label: "Backed up",
+			tone: "good",
+			detail: withWarning(`${snapshot}${tested}${copied}.`),
+		};
 	});
-	const heading = problems.length > 0 ? problems.join(", and ") : "every backup was made";
+	const warned = results.some((r) => r.consistencyWarning);
+	const testAlert = asked && problems.length === 0 && !warned;
+	const heading =
+		problems.length > 0
+			? problems.join(", and ")
+			: warned
+				? "point-in-time consistency was not verified"
+				: "every backup was made";
 	const message: AlertMessage = {
-		tone: problems.length > 0 ? "bad" : "good",
+		tone: problems.length > 0 ? "bad" : warned ? "late" : "good",
 		heading: `${heading.charAt(0).toUpperCase()}${heading.slice(1)}`,
-		meta: `${asked && problems.length === 0 ? "Test alert" : "Backup run"} · ${when(at)}`,
+		meta: `${testAlert ? "Test alert" : "Backup run"} · ${when(at)}`,
 		items,
 		more: {
 			text: `The catalog's ${results.some((r) => r.copy) ? "run, restore_test and copy" : "run and restore_test"} tables have the details, under this run's id:`,
 			code: instance,
 		},
 	};
-	return compose(
-		`run:${instance}`,
-		message,
-		asked && problems.length === 0 ? " (a test alert)" : "",
-	);
+	return compose(`run:${instance}`, message, testAlert ? " (a test alert)" : "");
 }
 
 const HOUR_MS = 60 * 60 * 1000;

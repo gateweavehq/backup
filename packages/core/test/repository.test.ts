@@ -1,11 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { concat, fromUtf8, Sha256, sha256Hex, utf8 } from "../src/bytes";
+import { describe, expect, it, vi } from "vitest";
+import { concat, fromHex, fromUtf8, Sha256, sha256Hex, utf8 } from "../src/bytes";
 import type { ChunkerParams } from "../src/cdc";
 import { generateMasterKey } from "../src/keys";
 import { Repository, RepositoryError, snapshotName } from "../src/repository";
 import { MemoryStore } from "../src/store";
 
 const chunker: ChunkerParams = { min: 1024, avg: 4096, max: 16384 };
+const EDIT_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+const EDIT_ID = "00112233445566778899aabbccddeeff";
 
 function text(length: number, seed = 7): Uint8Array<ArrayBuffer> {
 	let out = "";
@@ -22,6 +24,23 @@ async function fresh() {
 	const key = generateMasterKey();
 	const repo = await Repository.init(store, key, { chunker });
 	return { store, key, repo };
+}
+
+/** A repository whose chunk cuts are the same on every run: fixed key, and a fixed id for `init`. */
+async function pinned() {
+	const store = new MemoryStore();
+	const draw = vi.spyOn(crypto, "getRandomValues").mockImplementationOnce((array) => {
+		if (array)
+			new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(fromHex(EDIT_ID));
+		return array;
+	});
+	try {
+		const repo = await Repository.init(store, EDIT_KEY, { chunker });
+		expect(repo.config.id).toBe(EDIT_ID);
+		return { store, key: EDIT_KEY, repo };
+	} finally {
+		draw.mockRestore();
+	}
 }
 
 describe("a repository", () => {
@@ -65,7 +84,12 @@ describe("a repository", () => {
 	});
 
 	it("stores only what changed since the last snapshot", async () => {
-		const { store, repo } = await fresh();
+		// The cuts depend on keys derived from the master key and the repository's id. With random
+		// ones, the inserted row now and then lands in a stretch with no cut of its own, and the cuts
+		// forced at the largest size shift until the next natural one: CI saw 11 new chunks once.
+		// Fixed ones keep this exact (one new chunk), and a chunker that never found its cuts again
+		// would still store about half of the file's 43 chunks again here.
+		const { store, repo } = await pinned();
 		const first = text(200_000);
 		const one = await repo.writeFile("database.jsonl", first);
 		await repo.commit({ kind: "d1", name: "db" }, [one.entry]);
